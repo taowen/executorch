@@ -79,3 +79,5 @@ xcuserdata/
 # Agents
 .claude/*.local.*
 extension/pybindings/mlx.metallib
+outputs/
+uv.lock

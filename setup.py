@@ -737,15 +737,6 @@ class CustomBuild(build):
                 f"-DQNN_SDK_ROOT={qnn_sdk_root}",
             ]
 
-        # Enable OpenVINO backend on Linux. The backend uses dlopen at
-        # runtime so it has no build-time SDK dependency.
-        if sys.platform == "linux" and install_utils.is_cmake_option_on(
-            cmake_configuration_args,
-            "EXECUTORCH_BUILD_OPENVINO",
-            default=True,
-        ):
-            cmake_configuration_args += ["-DEXECUTORCH_BUILD_OPENVINO=ON"]
-
         with Buck2EnvironmentFixer():
             # Generate the cmake cache from scratch to ensure that the cache state
             # is predictable.

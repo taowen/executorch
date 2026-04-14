@@ -1,3 +1,0 @@
---index-url https://eiq.nxp.com/repository
-eiq-neutron-sdk==3.0.1
-eiq_nsys

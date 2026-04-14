@@ -1,5 +1,0 @@
-graphviz
-pydot
-py-cpuinfo
-requests
-tabulate
