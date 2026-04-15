@@ -25,19 +25,36 @@
 - `partitioner` 仅用于边界与约束控制（allow/blocklist、shape/limit、纯 Vulkan 门禁）。
 - 不把“新增融合语义”放在 partitioner 里实现。
 
-## 下一步（再实施）
-1. 在 Qwen3 decode 热路径上验证 `et_vk.silu_mul` 是否实际命中，并评估收益。
-2. 基于同一流程再选 1 个高频子图继续新增融合规则。
-3. 做三组对照（同模型同输入）：
-   - baseline（无新融合）
-   - profile-only（仅调 allow/blocklist 或 compile_options）
-   - candidate（启用新融合规则）
-4. 每组固定产出四项：
-   - 纯 Vulkan检查结果（`tools/et_tools/check_pure_vulkan.py`）
-   - Vulkan partition operator 列表
-   - prefill/decode 吞吐（tok/s）与首 token 延迟
-   - 数值一致性摘要（与 baseline 的误差阈值/抽样比对）
-5. 只接受“candidate 同时满足正确性 + 纯 Vulkan + 性能不退化（或明确收益）”的融合规则进入主线。
+## 下一个大目标（Phase 6）
+把“可控算子融合”从单点验证推进到**高效率研发工作流**：
+1. `M3` Shader JIT / 热替换（优先级最高）
+   - C++ 底座补一次能力：运行时加载外部 SPIR-V bundle。
+   - Python 工具链：GLSL -> SPIR-V -> bundle 打包与下发。
+   - 必须覆盖“融合新算子”场景：新增 `et_vk.*` fused op 后，可通过 shader bundle + Python 注册流程落地，不要求每次改动都重编译 C++。
+   - 验收：
+     - 只改 GLSL + Python 命令即可生效，不重编译 C++ 主体。
+     - 新 fused op 能在导出日志中命中，并在 Vulkan runtime 正常 dispatch。
+     - `check_pure_vulkan.py` 通过（无 KernelCall fallback）。
+2. `M4` Python 推理编排层
+   - 用 Python 管理多次 forward 与 KV cache，先覆盖 LLM decode loop。
+   - 验收：主 loop 不依赖 `llama_main` 的 C++ 逻辑。
+3. `M5` 扩展到多模型任务流（ASR/TTS）
+   - 通过 Python recipe 组合 encoder/decoder/sampler。
+   - 验收：新增模型主要改 Python，保持 pure Vulkan 约束。
+
+## 最近实测（2026-04-15）
+1. `silu_mul` 融合命中已验证
+   - 非本地源码路径（.venv 旧包）导出时未命中。
+   - 使用包含新 pattern 的代码后，Qwen3 导出日志出现 `et_vk.silu_mul.default`。
+
+2. 纯 Vulkan状态
+   - 未做 embedding quantize 的导出：`KernelCall=1 + DelegateCall=1`（非纯 Vulkan）。
+   - `embedding_quantize="4,32"` 后：`DelegateCall=1`，`KernelCall=0`，`check_pure_vulkan.py` 通过。
+
+3. 性能（同 prompt、`max_new_tokens=64`）
+   - `qwen3_0_6b_vulkan_emb4bit.pte`（历史基线）三次均值：decode ~`161.9` tok/s。
+   - `qwen3_0_6b_vulkan_silu_emb4bit_8da4w.pte` 三次均值：decode ~`170.3` tok/s。
+   - 当前观测：decode 有提升，prefill 波动较大，需固定时钟与更长样本再复核。
 
 ## 自定义融合实验流程（标准）
 1. 选择目标子图
