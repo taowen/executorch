@@ -254,8 +254,15 @@ if(NOT DEFINED FXDIV_SOURCE_DIR)
       ${CMAKE_POSITION_INDEPENDENT_CODE}
   )
   set(FXDIV_SOURCE_DIR "backends/xnnpack/third-party/FXdiv")
-  add_subdirectory("${FXDIV_SOURCE_DIR}")
-  executorch_move_interface_include_directories_to_build_time_only(fxdiv)
+  if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${FXDIV_SOURCE_DIR}/CMakeLists.txt")
+    add_subdirectory("${FXDIV_SOURCE_DIR}")
+    executorch_move_interface_include_directories_to_build_time_only(fxdiv)
+  else()
+    message(
+      STATUS
+        "Skipping FXdiv: ${FXDIV_SOURCE_DIR} not found (likely pruned backend)"
+    )
+  endif()
   set(CMAKE_POSITION_INDEPENDENT_CODE
       ${ORIGINAL_CMAKE_POSITION_INDEPENDENT_CODE_FLAG}
   )
@@ -295,18 +302,28 @@ if(EXECUTORCH_BUILD_CPUINFO)
       CACHE STRING ""
   )
   set(CLOG_SOURCE_DIR "${CPUINFO_SOURCE_DIR}/deps/clog")
-  add_subdirectory("${CPUINFO_SOURCE_DIR}")
-  set(CMAKE_POSITION_INDEPENDENT_CODE
-      ${ORIGINAL_CMAKE_POSITION_INDEPENDENT_CODE_FLAG}
-  )
-  executorch_add_prefix_to_public_headers(cpuinfo "${CPUINFO_SOURCE_DIR}/")
-  install(
-    TARGETS cpuinfo
-    EXPORT ExecuTorchTargets
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    INCLUDES
-    DESTINATION ${_common_include_directories}
-  )
+  if(EXISTS "${CPUINFO_SOURCE_DIR}/CMakeLists.txt")
+    add_subdirectory("${CPUINFO_SOURCE_DIR}")
+    set(CMAKE_POSITION_INDEPENDENT_CODE
+        ${ORIGINAL_CMAKE_POSITION_INDEPENDENT_CODE_FLAG}
+    )
+    executorch_add_prefix_to_public_headers(cpuinfo "${CPUINFO_SOURCE_DIR}/")
+    install(
+      TARGETS cpuinfo
+      EXPORT ExecuTorchTargets
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      INCLUDES
+      DESTINATION ${_common_include_directories}
+    )
+  else()
+    set(CMAKE_POSITION_INDEPENDENT_CODE
+        ${ORIGINAL_CMAKE_POSITION_INDEPENDENT_CODE_FLAG}
+    )
+    message(
+      STATUS
+        "Skipping cpuinfo: ${CPUINFO_SOURCE_DIR} not found (likely pruned backend)"
+    )
+  endif()
 endif()
 
 if(EXECUTORCH_BUILD_PTHREADPOOL)
@@ -338,30 +355,37 @@ if(EXECUTORCH_BUILD_PTHREADPOOL)
         CACHE STRING ""
     )
   endif()
-  add_subdirectory("${PTHREADPOOL_SOURCE_DIR}")
-  executorch_move_interface_include_directories_to_build_time_only(pthreadpool)
-  executorch_move_interface_include_directories_to_build_time_only(
-    pthreadpool_interface
-  )
+  if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${PTHREADPOOL_SOURCE_DIR}/CMakeLists.txt")
+    add_subdirectory("${PTHREADPOOL_SOURCE_DIR}")
+    executorch_move_interface_include_directories_to_build_time_only(pthreadpool)
+    executorch_move_interface_include_directories_to_build_time_only(
+      pthreadpool_interface
+    )
 
-  if(APPLE)
-    # Use hidden visibility for pthreadpool on Apple platforms to avoid issues
-    # with pthreadpool symbols from libtorch_cpu taking precedence over the ones
-    # from the pthreadpool library statically linked in _portable_lib. The
-    # pthreadpool public APIs are marked as weak by default on some Apple
-    # platforms, so setting to hidden visibility works around this by not
-    # putting the symbol in the indirection table. See
-    # https://github.com/pytorch/executorch/issues/14321 for more details.
-    target_compile_options(pthreadpool PRIVATE -fvisibility=hidden)
+    if(APPLE)
+      # Use hidden visibility for pthreadpool on Apple platforms to avoid issues
+      # with pthreadpool symbols from libtorch_cpu taking precedence over the ones
+      # from the pthreadpool library statically linked in _portable_lib. The
+      # pthreadpool public APIs are marked as weak by default on some Apple
+      # platforms, so setting to hidden visibility works around this by not
+      # putting the symbol in the indirection table. See
+      # https://github.com/pytorch/executorch/issues/14321 for more details.
+      target_compile_options(pthreadpool PRIVATE -fvisibility=hidden)
+    endif()
+
+    install(
+      TARGETS pthreadpool pthreadpool_interface fxdiv
+      EXPORT ExecuTorchTargets
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      INCLUDES
+      DESTINATION ${_common_include_directories}
+    )
+  else()
+    message(
+      STATUS
+        "Skipping pthreadpool: ${PTHREADPOOL_SOURCE_DIR} not found (likely pruned backend)"
+    )
   endif()
-
-  install(
-    TARGETS pthreadpool pthreadpool_interface fxdiv
-    EXPORT ExecuTorchTargets
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    INCLUDES
-    DESTINATION ${_common_include_directories}
-  )
   set(CMAKE_POSITION_INDEPENDENT_CODE
       ${ORIGINAL_CMAKE_POSITION_INDEPENDENT_CODE_FLAG}
   )
