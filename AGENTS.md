@@ -141,5 +141,14 @@ TOKENIZER_JSON=$(ls ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/
 ```
 
 ### 5) 纯 Vulkan 检查（必须）
-- 检查执行日志/trace，确认无 CPU fallback。
-- 若出现 fallback：定位算子与原因，回到 `M2` 修融合/支持，不计入达成。
+```bash
+set -euxo pipefail
+TOKENIZER_JSON=$(ls ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json | head -n1)
+
+.venv/bin/python tools/et_tools/check_pure_vulkan.py \
+  --pte ./qwen3_0_6b_vulkan_pure_candidate.pte \
+  --flatc ./.venv/bin/flatc \
+  --run-cmd "./cmake-out-linux-vulkan/examples/models/llama/llama_main --model_path ./qwen3_0_6b_vulkan_pure_candidate.pte --tokenizer_path ${TOKENIZER_JSON:?} --prompt 'Write a short poem about Vulkan.'"
+```
+
+- 若检查失败：定位未下放算子或 runtime 日志中的 fallback，再回到 `M2` 修融合/支持，不计入达成。
