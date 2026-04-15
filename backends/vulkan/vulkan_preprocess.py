@@ -36,7 +36,15 @@ from executorch.backends.vulkan.serialization.vulkan_graph_schema import (
 from executorch.backends.vulkan.serialization.vulkan_graph_serialize import (
     serialize_vulkan_graph,
 )
-from executorch.backends.xnnpack._passes import FuseBatchNormPass
+try:
+    from executorch.backends.xnnpack._passes import FuseBatchNormPass
+except ModuleNotFoundError:
+    class FuseBatchNormPass:  # type: ignore[no-redef]
+        def __init__(self, _program: Any) -> None:
+            pass
+
+        def __call__(self, program: Any) -> Any:
+            return program
 from executorch.exir.backend.backend_details import (
     BackendDetails,
     CompileSpec,

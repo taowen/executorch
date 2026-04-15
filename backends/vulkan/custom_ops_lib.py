@@ -138,6 +138,23 @@ lib.define(f"{name}(Tensor self, int stride, float offset) -> Tensor")
 lib.impl(name, grid_priors_impl, "CompositeExplicitAutograd")
 grid_priors_op = getattr(getattr(torch.ops, namespace), name)
 
+##############
+## silu_mul ##
+##############
+
+
+def silu_mul_impl(
+    x: torch.Tensor,
+    other: torch.Tensor,
+):
+    return torch.nn.functional.silu(x) * other
+
+
+name = "silu_mul"
+lib.define(f"{name}(Tensor self, Tensor other) -> Tensor")
+lib.impl(name, silu_mul_impl, "CompositeExplicitAutograd")
+silu_mul_op = getattr(getattr(torch.ops, namespace), name)
+
 
 # When lowering to executorch, ops are converted from default to out variant. Hence, custom ops define both variants.
 def grid_priors_out_impl(

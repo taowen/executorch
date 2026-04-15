@@ -87,6 +87,44 @@ def op_node_count(graph_module: torch.fx.GraphModule, canonical_op_name: str) ->
 
 
 class TestVulkanPasses(unittest.TestCase):
+    def test_fuse_silu_mul(self):
+        """Test conversion of silu(x) * y into et_vk.silu_mul custom op."""
+
+        class SiluMulModel(torch.nn.Module):
+            def forward(self, x: torch.Tensor, y: torch.Tensor):
+                return torch.nn.functional.silu(x) * y
+
+        model = SiluMulModel()
+        sample_inputs = (torch.randn(2, 8, 32), torch.randn(2, 8, 32))
+
+        edge_compile_config = EdgeCompileConfig(
+            _skip_dim_order=False,
+            _check_ir_validity=False,
+        )
+
+        program = torch.export.export(model, sample_inputs, strict=True)
+        edge_manager = to_edge(
+            program,
+            compile_config=edge_compile_config,
+        )
+
+        ep = edge_manager._edge_programs["forward"]
+        fuse_pass = FusePatternsPass()
+        fuse_pass._exported_program = ep
+        result = fuse_pass.call(ep.graph_module)
+
+        self.assertTrue(result.modified)
+
+        gm = ep.graph_module
+        fused_count = 0
+        for node in gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            target_name = str(node.target)
+            if "et_vk.silu_mul.default" in target_name:
+                fused_count += 1
+        self.assertGreaterEqual(fused_count, 1)
+
     def test_fuse_rotary_emb(self):
         """Test conversion of rotary embedding pattern to et_vk.apply_rotary_emb custom op."""
 

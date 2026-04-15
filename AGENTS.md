@@ -6,6 +6,11 @@
 - `examples/models/llama/export_llama_lib.py`：主导出路径仅走 Vulkan；`_get_source_transforms` 中 `qnn/mps/coreml/mlx` 分支已删除；多后端分支改为禁用。
 - `backends/vulkan/partitioner/vulkan_partitioner.py`：新增基于 op 名称的 allow/block list（支持前缀 `*` 通配）。
 - `backends/vulkan/vulkan_preprocess.py`：支持 Python 侧开关 `disable_fuse_patterns` / `disable_fuse_quantized_ops`。
+- `et_vk.silu_mul` 融合样例已打通（pattern + custom op + runtime op + shader）：
+  - Python 融合：`backends/vulkan/patterns/silu_mul.py`
+  - 自定义 op：`backends/vulkan/custom_ops_lib.py`
+  - Runtime dispatch：`backends/vulkan/runtime/graph/ops/impl/BinaryOp.cpp`
+  - Shader 变体：`backends/vulkan/runtime/graph/ops/glsl/binary_op_{buffer,texture}.yaml`
 
 ## 算子融合实现（当前真实机制）
 融合不是 C++ 侧硬编码调度，而是 Python 图改写 + 分区共同决定：
@@ -21,21 +26,23 @@
 - 不把“新增融合语义”放在 partitioner 里实现。
 
 ## 下一步（再实施）
-1. 固化 Python profile 格式（环境变量或 json 文件）用于控制：
-   - `compile_options`（如 `disable_fuse_patterns`）
-   - `operator_name_allowlist/blocklist`
-2. 新增融合时优先实现 Python transform/pattern，并提供最小回归样例。
-3. 做两组固定对照实验（同模型同输入）：
-   - baseline
-   - profile 改边界
-4. 每组都产出：
-   - `Found X Vulkan subgraphs`
+1. 在 Qwen3 decode 热路径上验证 `et_vk.silu_mul` 是否实际命中，并评估收益。
+2. 基于同一流程再选 1 个高频子图继续新增融合规则。
+3. 做三组对照（同模型同输入）：
+   - baseline（无新融合）
+   - profile-only（仅调 allow/blocklist 或 compile_options）
+   - candidate（启用新融合规则）
+4. 每组固定产出四项：
+   - 纯 Vulkan检查结果（`tools/et_tools/check_pure_vulkan.py`）
    - Vulkan partition operator 列表
-   - `tools/et_tools/check_pure_vulkan.py` 结果
+   - prefill/decode 吞吐（tok/s）与首 token 延迟
+   - 数值一致性摘要（与 baseline 的误差阈值/抽样比对）
+5. 只接受“candidate 同时满足正确性 + 纯 Vulkan + 性能不退化（或明确收益）”的融合规则进入主线。
 
 ## 自定义融合实验流程（标准）
 1. 选择目标子图
    - 先在导出图中确定稳定模式（输入输出形状与 dtype 约束清楚）。
+   - 优先选择 decode 热路径高频子图，避免低价值“只改边界”实验。
 2. 实现融合规则（Python）
    - 在 `backends/vulkan/patterns/` 新增 pattern 文件。
    - 实现 detector/graph matcher + replacement，将子图替换为目标 fused op。
@@ -43,16 +50,20 @@
 3. 对齐 Vulkan 支持
    - 若 fused op 是新 op 名，更新 `backends/vulkan/op_registry.py`。
    - 仅在确有需要时再调整 `partitioner` 约束。
-4. 对照导出
-   - A: 不启用新融合（baseline）
-   - B: 启用新融合（candidate）
-5. 固定三项对比输出
-   - `Found X Vulkan subgraphs`
-   - `Operators included in this Vulkan partition`
+4. 三组对照导出
+   - A: baseline（无新融合）
+   - B: profile-only（仅配置改边界）
+   - C: candidate（启用新融合）
+5. 固定四项对比输出
    - `tools/et_tools/check_pure_vulkan.py` 结果
+   - `Operators included in this Vulkan partition`
+   - prefill/decode 性能指标
+   - 数值一致性摘要
 6. 验收
-   - candidate 相比 baseline 出现预期 fused op 且边界变化可解释。
+   - candidate 出现预期 fused op 且边界变化可解释。
    - 纯 Vulkan检查通过（无 CPU fallback）。
+   - 与 baseline 数值一致性在阈值内。
+   - decode 指标不退化，或有明确收益。
    - 有最小回归样例覆盖该融合规则。
 
 ## 当前阶段：Phase 5（Python-first，Pure Vulkan）

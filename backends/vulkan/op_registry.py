@@ -256,6 +256,7 @@ def register_clamp():
         exir_ops.edge.aten.sub.Tensor,
         exir_ops.edge.aten.minimum.default,
         exir_ops.edge.aten.mul.Tensor,
+        exir_ops.edge.et_vk.silu_mul.default,
         exir_ops.edge.aten.div.Tensor,
         exir_ops.edge.aten.div.Tensor_mode,
         exir_ops.edge.aten.pow.Tensor_Tensor,
