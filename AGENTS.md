@@ -1,50 +1,89 @@
 # AGENTS.md
 
-## 目标
-- 只保留一条主线：`PyTorch -> ExecuTorch 导出 -> Vulkan 运行验证`。
-- 用 `Qwen3-0.6B` 做端到端验证。
-- 最终仓库应尽量精简，只保留“导出 + Vulkan 运行”所需代码。
-- 全流程使用 `uv` 管理 Python 环境。
+## 当前阶段：Phase 5（Python-first，Pure Vulkan）
+目标：在 Linux 上形成“低频 C++ 基座 + 高频 Python 控制层”的开发模式，推理目标态为**纯 Vulkan**（不接受 CPU fallback 作为最终状态）。
 
-## 执行原则
-- 所有步骤默认在仓库根目录执行：`/home/taowen/projects/executorch`。
-- 先删明显无关 backend，再安装依赖，避免无用依赖下载。
-- 每一步都要可重复执行（幂等），失败可重试。
+约束定义：
+- 纯 Vulkan：核心算子执行必须在 Vulkan delegate 内完成。
+- 融合：指调整 Vulkan shader/子图边界，不是 Vulkan+CPU 混合切分。
+- Python 优先：导出、融合策略、任务 loop、实验控制优先在 Python 完成。
 
-## Phase 0: 第一轮裁剪（安装前）
-先做一次“确定无用”删除，目标是 iOS / Android Java / QNN 等与当前目标无关部分。
+## 可行性评估（基于当前代码）
+1. Python 多次 forward 调度：可行
+   - 现有 `runtime/__init__.py` 已提供 `Runtime -> Program -> Method.execute()` 接口，足够承载 LLM/ASR/TTS 的 Python loop。
+2. 融合粒度 Python 化：可行
+   - Vulkan partition/registry 位于 Python 侧（`backends/vulkan/partitioner`、`backends/vulkan/op_registry.py`），可通过配置驱动融合边界。
+3. Shader JIT 且“不重编译 C++”：部分可行，需一次性补底座
+   - 当前 shader 主要通过 `gen_vulkan_spv.py` 生成并静态编入 C++。
+   - 要做到“改 GLSL 立即生效”，需要补一个低频 C++ 能力：运行时加载外部 SPIR-V bundle（或等价注册入口）。
+4. ASR/TTS 全量纯 Vulkan：中期目标
+   - LLM（Qwen3-0.6B）可作为第一优先验证路径。
+   - ASR/TTS 需按模型逐个推进，不承诺一步到位全模型纯 Vulkan。
 
-```bash
-set -euxo pipefail
+结论：计划总体可行，但必须分阶段推进，并把“shader 动态加载”设为前置里程碑。
 
-# iOS / Apple
-rm -rf backends/apple extension/apple examples/apple
+## 里程碑（修正版）
+1. `M1` 建立可复现 Pure Vulkan 基线（Qwen3-0.6B）
+   - 导出、构建、运行命令固定化。
+   - 形成 fallback 检查脚本（日志关键字 + 覆盖率报告）。
+   - 验收：同一命令可稳定复现，且核心路径无 CPU fallback。
 
-# Qualcomm QNN
-rm -rf backends/qualcomm examples/qualcomm
+2. `M2` 融合粒度配置化（Python）
+   - 增加 `fusion_profile`：pass 开关、allow/block list、buffer/shape 阈值。
+   - 输出“未下放原因”报告（按算子统计）。
+   - 验收：不改 C++ 即可改变 shader 边界，并能解释每处 fallback 原因。
 
-# Android Java/JNI 侧（纯 C++ Vulkan runner 不需要）
-rm -rf extension/android extension/android_test examples/demo-apps
+3. `M3` Shader JIT（一次性 C++ 补口 + Python 工作流）
+   - C++：新增运行时 shader bundle 加载能力（低频修改）。
+   - Python：GLSL -> SPIR-V 编译与 bundle 打包、热替换脚本。
+   - 验收：仅改 GLSL + Python 命令即可生效，无需重新链接 C++ 主体。
 
-# 其他明显无关厂商 backend（按需保守删）
-rm -rf backends/mediatek backends/samsung backends/nxp backends/cadence
-```
+4. `M4` Python 任务编排层（LLM -> ASR/TTS）
+   - 先落地 LLM decode loop（含 kv cache 管理）到 Python。
+   - 再接 ASR/TTS 最小可用 loop（encoder/decoder/sampler 组合）。
+   - 验收：多次 forward 逻辑主要在 Python，C++ runner 可降为可选。
 
-说明：不要删 `backends/vulkan`、`extension/llm`、`examples/models/qwen3`、`examples/models/llama`。
+5. `M5` 扩模型与回归体系
+   - 新模型接入模板化（导出配置 + loop recipe + Vulkan 覆盖报告）。
+   - 性能/正确性回归自动化。
+   - 验收：新增模型主要改 Python 配置与脚本。
 
-## Phase 1: 用 uv 准备最小环境
+## 目录规划
+- `python/et_fusion/`：融合/分区策略与覆盖报告
+- `python/et_shader_jit/`：GLSL->SPV JIT、bundle 生成与加载工具
+- `python/et_loop/`：LLM/ASR/TTS Python 编排层
+- `python/et_tools/`：profiling、trace、回归脚本
+
+## 验收口径（强约束）
+1. 功能口径
+   - `pure_vulkan=true` 模式下，出现 CPU fallback 即判失败。
+2. 观测口径
+   - 每次导出/融合调整都产出：
+     - Vulkan 覆盖率
+     - 未下放算子列表及原因
+     - 关键性能指标（prefill/decode）
+3. 迭代口径
+   - 高频变更集中在 Python；C++ 仅在 runtime 能力缺口时低频变更。
+
+## 风险与应对
+1. `op_registry` 覆盖不足导致 fallback
+   - 应对：优先补 Vulkan op 支持或调整导出图，禁止以 CPU fallback 作为“完成”。
+2. 大 tensor/embedding 超阈值无法下放
+   - 应对：参数化 `buffer_limit`，并在报告中明确触发点。
+3. shader 动态加载未打通前研发效率低
+   - 应对：把该能力前置到 `M3`，作为后续快速迭代前提。
+
+## Baseline（当前可运行）
+### 1) 环境准备
 ```bash
 set -euxo pipefail
 uv venv .venv
-
-# 最小安装，避免 example 依赖全集
 .venv/bin/python ./install_executorch.py --minimal
 ```
 
-## Phase 2: 导出 Qwen3-0.6B 到 Vulkan
+### 2) 导出 Qwen3-0.6B（Pure Vulkan 候选）
 ```bash
 set -euxo pipefail
-
 FLATC_EXECUTABLE="$PWD/.venv/bin/flatc" \
 .venv/bin/python -m extension.llm.export.export_llm \
   base.model_class=qwen3_0_6b \
@@ -56,27 +95,12 @@ FLATC_EXECUTABLE="$PWD/.venv/bin/flatc" \
   backend.vulkan.enabled=true \
   backend.vulkan.force_fp16=true \
   model.dtype_override=fp32 \
-  quantization.qmode=8da4w \
-  quantization.group_size=32 \
-  'quantization.embedding_quantize="4,32"' \
-  export.output_name=qwen3_0_6b_vulkan_emb4bit.pte
+  export.output_name=qwen3_0_6b_vulkan_pure_candidate.pte
 ```
 
-输出文件：`./qwen3_0_6b_vulkan_emb4bit.pte`
-
-备注：
-- 上面是“KV + SDPA + 8da4w + Vulkan 优化”组合。
-- 该组合当前会出现部分 CPU fallback（并非纯 Vulkan 全图），用于功能验证没问题；若要评估“纯 Vulkan 可裁剪面”，需要再跑一版不含 `8da4w` 的对照导出。
-
-## Phase 3: 纯 Vulkan 运行验证（本机 Linux）
+### 3) 构建（Vulkan-only）
 ```bash
 set -euxo pipefail
-
-# 先确认本机 Vulkan 环境可用（至少有 Vulkan loader + 驱动 + glslc）
-vulkaninfo | head -n 20 || true
-command -v glslc
-glslc --version | head -n 1
-
 cmake -S . -B cmake-out-linux-vulkan \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$PWD/cmake-out-linux-vulkan/install" \
@@ -105,70 +129,17 @@ cmake -S examples/models/llama -B cmake-out-linux-vulkan/examples/models/llama \
 cmake --build cmake-out-linux-vulkan/examples/models/llama -j"$(nproc)" --config Release
 ```
 
-本机运行验证：
+### 4) 运行验证
 ```bash
-# tokenizer 路径按本机实际缓存调整
+set -euxo pipefail
 TOKENIZER_JSON=$(ls ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json | head -n1)
 
 ./cmake-out-linux-vulkan/examples/models/llama/llama_main \
-  --model_path ./qwen3_0_6b_vulkan_emb4bit.pte \
+  --model_path ./qwen3_0_6b_vulkan_pure_candidate.pte \
   --tokenizer_path "${TOKENIZER_JSON:?}" \
   --prompt "Write a short poem about Vulkan."
 ```
 
-## Phase 4: 必要代码识别与第二轮裁剪
-先收集“实际被用到”的代码，再删剩余无关目录。
-
-建议保留白名单（最小起点）：
-- `backends/vulkan/`
-- `extension/llm/`
-- `examples/models/qwen3/`
-- `examples/models/llama/`
-- `runtime/`
-- `kernels/`
-- `schema/`
-- `exir/`
-- `export/`
-- `third-party/`（按构建报错再细化）
-
-第二轮删除规则：
-- 任何不在白名单且不被 CMake/导出脚本引用的目录，直接删除。
-- 每删一批，必须重新执行一次 Phase 2 + Phase 3 冒烟验证。
-
-## 实际关键代码（本次链路）
-以下是这次 `Qwen3-0.6B -> Vulkan -> llama_main` 实测中真正走到的关键代码入口，后续裁剪优先保留：
-
-- 导出总入口
-  - `extension/llm/export/export_llm.py`
-  - `extension/llm/export/config/llm_config.py`
-  - `extension/llm/export/partitioner_lib.py`
-- 量化与 KV/SDPA 替换
-  - `extension/llm/export/quantize.py`（`8da4w`）
-  - `examples/models/llama/source_transformation/custom_kv_cache.py`
-  - `examples/models/llama/source_transformation/sdpa.py`
-- Vulkan 分区与算子支持
-  - `backends/vulkan/partitioner/vulkan_partitioner.py`
-  - `backends/vulkan/op_registry.py`
-  - `backends/vulkan/utils.py`
-- Vulkan 运行时
-  - `backends/vulkan/runtime/`
-  - `backends/vulkan/runtime/gen_vulkan_spv.py`
-  - `backends/vulkan/runtime/graph/ops/glsl/`
-- C++ runner 主链路
-  - `examples/models/llama/main.cpp`
-  - `examples/models/llama/runner/runner.cpp`
-  - `extension/llm/runner/text_token_generator.h`
-  - `extension/llm/runner/text_decoder_runner.h/.cpp`
-  - `extension/llm/sampler/util.h`
-  - `extension/llm/sampler/sampler.cpp`
-
-## 当前已定位的性能/纯 Vulkan问题点
-- `8da4w + quantize_kv_cache` 组合下，`llama.custom_quantized_sdpa` 不在 Vulkan 注册表中，会触发 CPU fallback。
-- embedding 存在 size gate：`backends/vulkan/op_registry.py` 会检查 `aten.embedding` 权重 `numel`，超过 `DEFAULT_BUFFER_LIMIT`（`backends/vulkan/utils.py`，默认 `128 * 1024 * 1024`）则不分给 Vulkan。
-- decode 每步在 runner 中调用 `logits_to_token`（`extension/llm/sampler/util.h`）直接在 logits 指针上做 CPU 采样；即便主图大量在 Vulkan，这一步仍有同步/CPU开销。
-
-## 验收标准
-- 能稳定产出 `qwen3_0_6b_vulkan_emb4bit.pte`。
-- `llama_main` 能在本机 Linux 加载并推理该 `.pte`。
-- 构建参数里仅启用 Vulkan（`EXECUTORCH_BUILD_VULKAN=ON`，`EXECUTORCH_BUILD_XNNPACK=OFF`）。
-- 相比初始仓库，非目标 backend 代码显著减少，且流程仍可复现。
+### 5) 纯 Vulkan 检查（必须）
+- 检查执行日志/trace，确认无 CPU fallback。
+- 若出现 fallback：定位算子与原因，回到 `M2` 修融合/支持，不计入达成。
