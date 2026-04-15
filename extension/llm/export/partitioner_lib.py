@@ -7,7 +7,7 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 # This workspace is intentionally focused on a Linux + Vulkan export/runtime path.
@@ -44,7 +44,7 @@ def _load_vulkan_profile_from_env() -> Dict[str, Any]:
     return parsed
 
 
-def get_xnnpack_partitioner(dynamic_quant_only_partitioner: bool = True):
+def get_xnnpack_partitioner(*args, **kwargs):
     raise _unsupported_backend("XNNPACK")
 
 
@@ -77,42 +77,29 @@ def get_vulkan_partitioner(
     )
 
 
-def get_mps_partitioner(use_kv_cache: bool = False):
+def get_mps_partitioner(*args, **kwargs):
     raise _unsupported_backend("MPS")
 
 
-def get_openvino_partitioner(device: str):
+def get_openvino_partitioner(*args, **kwargs):
     raise _unsupported_backend("OpenVINO")
 
 
-def get_coreml_partitioner(
-    ios: int = 15,
-    embedding_quantize: Optional[str] = None,
-    pt2e_quantize: Optional[str] = None,
-    coreml_quantize: Optional[str] = None,
-    coreml_compute_units: Optional[str] = None,
-):
+def get_coreml_partitioner(*args, **kwargs):
     raise _unsupported_backend("CoreML")
 
 
-def get_qnn_partitioner(
-    use_kv_cache: bool = False,
-    pt2e_quantize: Optional[str] = None,
-    num_sharding: int = 0,
-    soc_model: str = "SM8650",
-):
+def get_qnn_partitioner(*args, **kwargs):
     raise _unsupported_backend("QNN")
 
 
-def get_tosa_partitioner(version: str):
+def get_tosa_partitioner(*args, **kwargs):
     raise _unsupported_backend("TOSA")
 
 
-def get_ethosu_partitioner(target: str):
+def get_ethosu_partitioner(*args, **kwargs):
     raise _unsupported_backend("Ethos-U")
 
 
-def get_vgf_partitioner(
-    compile_spec: Optional[str], compiler_flags: Optional[List[str]]
-):
+def get_vgf_partitioner(*args, **kwargs):
     raise _unsupported_backend("VGF")
