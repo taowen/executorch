@@ -8,6 +8,7 @@
 
 #include <executorch/backends/vulkan/runtime/ResolveLayouts.h>
 #include <executorch/backends/vulkan/runtime/VulkanDelegateHeader.h>
+#include <executorch/backends/vulkan/runtime/VulkanExecuteTelemetry.h>
 #include <executorch/backends/vulkan/serialization/schema_generated.h>
 
 #include <executorch/backends/vulkan/runtime/graph/ComputeGraph.h>
@@ -32,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib> /* strtol */
 #include <cstring>
+#include <chrono>
 #include <memory>
 #include <type_traits>
 #include <unordered_map>
@@ -40,6 +42,28 @@
 namespace executorch {
 namespace backends {
 namespace vulkan {
+
+namespace {
+using SteadyClock = std::chrono::steady_clock;
+
+thread_local bool t_has_last_execute_telemetry = false;
+thread_local VulkanExecuteTelemetry t_last_execute_telemetry{};
+thread_local uint64_t t_last_execute_generation = 0;
+} // namespace
+
+bool get_last_vulkan_execute_telemetry(VulkanExecuteTelemetry* out) {
+  if (out == nullptr || !t_has_last_execute_telemetry) {
+    return false;
+  }
+  *out = t_last_execute_telemetry;
+  return true;
+}
+
+void reset_last_vulkan_execute_telemetry() {
+  t_has_last_execute_telemetry = false;
+  t_last_execute_telemetry = VulkanExecuteTelemetry{};
+}
+
 namespace {
 
 using executorch::runtime::ArrayRef;
@@ -197,6 +221,11 @@ GraphConfig get_graph_config(ArrayRef<CompileSpec>& compile_specs) {
       bool value = getBool(value_data);
 
       config.warmup_execute_after_compile = value;
+    }
+    if (strcmp(spec.key, "enable_querypool") == 0) {
+      ET_CHECK_MSG(value_size == sizeof(uint8_t), "Unexpected value size!");
+      bool value = getBool(value_data);
+      config.enable_querypool = value;
     }
   }
 #ifdef ET_EVENT_TRACER_ENABLED
@@ -703,6 +732,7 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
       DelegateHandle* handle,
       Span<EValue*> args) const override {
     EXECUTORCH_SCOPE_PROF("VulkanBackend::execute");
+    const auto t_overall_begin = SteadyClock::now();
 
     ComputeGraph* compute_graph = static_cast<ComputeGraph*>(handle);
 
@@ -724,6 +754,7 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
             "ETVK_COPY_INPUTS",
             /* delegate_debug_id = */ -1);
 #endif // ET_EVENT_TRACER_ENABLED
+    const auto t_copy_inputs_begin = SteadyClock::now();
     for (size_t i = 0; i < num_inputs; i++) {
       const ValueRef iref = compute_graph->inputs()[i].value;
       if (compute_graph->val_is_tensor(iref)) {
@@ -752,11 +783,13 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
             compute_graph->get_val_type(iref));
       }
     }
+    const auto t_copy_inputs_end = SteadyClock::now();
 #ifdef ET_EVENT_TRACER_ENABLED
     event_tracer_end_profiling_delegate(
         event_tracer, copy_inputs_event_tracer_entry);
 #endif // ET_EVENT_TRACER_ENABLED
 
+    const auto t_resize_begin = SteadyClock::now();
     if (should_propagate_resize || compute_graph->has_data_dependent_shapes()) {
 #ifdef ET_EVENT_TRACER_ENABLED
       runtime::EventTracerEntry resize_event_tracer_entry =
@@ -771,6 +804,7 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
           event_tracer, resize_event_tracer_entry);
 #endif // ET_EVENT_TRACER_ENABLED
     }
+    const auto t_resize_end = SteadyClock::now();
 
 #ifdef ET_EVENT_TRACER_ENABLED
     runtime::EventTracerEntry execute_event_tracer_entry =
@@ -779,26 +813,37 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
             "ETVK_COMPUTE_GRAPH_EXECUTE",
             /* delegate_debug_id = */ -1);
 #endif // ET_EVENT_TRACER_ENABLED
+    const auto t_compute_begin = SteadyClock::now();
     compute_graph->execute();
+    const auto t_compute_end = SteadyClock::now();
 #ifdef ET_EVENT_TRACER_ENABLED
     event_tracer_end_profiling_delegate(
         event_tracer, execute_event_tracer_entry);
 #endif // ET_EVENT_TRACER_ENABLED
 
+    double gpu_shader_total_ms = 0.0;
+    uint64_t gpu_shader_dispatch_count = 0;
+    if (compute_graph->context()->querypool()) {
+      compute_graph->context()->querypool().extract_results();
+      for (const auto& r :
+           compute_graph->context()->querypool().get_shader_timestamp_data()) {
+        if (r.end_time_ns >= r.start_time_ns) {
+          gpu_shader_total_ms +=
+              static_cast<double>(r.end_time_ns - r.start_time_ns) / 1.0e6;
+        }
+        gpu_shader_dispatch_count += 1;
 #ifdef ET_EVENT_TRACER_ENABLED
-    compute_graph->context()->querypool().extract_results();
-    for (const auto& r :
-         compute_graph->context()->querypool().get_shader_timestamp_data()) {
-      std::string event_name = "{" + r.kernel_name +
-          ", \"dispatch_id\": " + std::to_string(r.dispatch_id) + "}";
-      event_tracer_log_profiling_delegate(
-          event_tracer,
-          event_name.c_str(),
-          /* delegate_debug_id = */ -1,
-          r.start_time_ns,
-          r.end_time_ns);
-    }
+        std::string event_name = "{" + r.kernel_name +
+            ", \"dispatch_id\": " + std::to_string(r.dispatch_id) + "}";
+        event_tracer_log_profiling_delegate(
+            event_tracer,
+            event_name.c_str(),
+            /* delegate_debug_id = */ -1,
+            r.start_time_ns,
+            r.end_time_ns);
 #endif // ET_EVENT_TRACER_ENABLED
+      }
+    }
 
 #ifdef ET_EVENT_TRACER_ENABLED
     runtime::EventTracerEntry copy_outputs_event_tracer_entry =
@@ -807,6 +852,7 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
             "ETVK_COPY_OUTPUTS",
             /* delegate_debug_id = */ -1);
 #endif // ET_EVENT_TRACER_ENABLED
+    const auto t_copy_outputs_begin = SteadyClock::now();
     const size_t output_offset = args.size() - num_outputs;
     for (size_t i = 0; i < num_outputs; i++) {
       const size_t o = output_offset + i;
@@ -831,6 +877,7 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
             compute_graph->get_val_type(oref));
       }
     }
+    const auto t_copy_outputs_end = SteadyClock::now();
 #ifdef ET_EVENT_TRACER_ENABLED
     event_tracer_end_profiling_delegate(
         event_tracer, copy_outputs_event_tracer_entry);
@@ -840,6 +887,28 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
     event_tracer_end_profiling_delegate(
         event_tracer, overall_event_tracer_entry);
 #endif // ET_EVENT_TRACER_ENABLED
+
+    VulkanExecuteTelemetry telemetry{};
+    telemetry.generation = ++t_last_execute_generation;
+    telemetry.copy_inputs_ms = std::chrono::duration<double, std::milli>(
+                                   t_copy_inputs_end - t_copy_inputs_begin)
+                                   .count();
+    telemetry.resize_ms =
+        std::chrono::duration<double, std::milli>(t_resize_end - t_resize_begin)
+            .count();
+    telemetry.compute_graph_execute_ms = std::chrono::duration<double, std::milli>(
+                                             t_compute_end - t_compute_begin)
+                                             .count();
+    telemetry.copy_outputs_ms = std::chrono::duration<double, std::milli>(
+                                    t_copy_outputs_end - t_copy_outputs_begin)
+                                    .count();
+    telemetry.total_backend_ms = std::chrono::duration<double, std::milli>(
+                                     t_copy_outputs_end - t_overall_begin)
+                                     .count();
+    telemetry.gpu_shader_total_ms = gpu_shader_total_ms;
+    telemetry.gpu_shader_dispatch_count = gpu_shader_dispatch_count;
+    t_last_execute_telemetry = telemetry;
+    t_has_last_execute_telemetry = true;
 
     return Error::Ok;
   }

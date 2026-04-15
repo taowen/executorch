@@ -41,7 +41,7 @@ class PlanReport:
 
 def _repo_root_from_script(script_path: Path) -> Path:
     # exshader/check_pure_vulkan.py -> repo root
-    return script_path.resolve().parents[2]
+    return script_path.resolve().parents[1]
 
 
 def _default_flatc() -> str:

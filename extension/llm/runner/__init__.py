@@ -11,37 +11,63 @@ This module provides a Python interface to the ExecuTorch multimodal LLM runner,
 enabling processing of mixed inputs (text, images, audio) and text generation.
 """
 
-import torch  # preload libtorch shared libs for _llm_runner
-
 try:
-    # Import shared components from the compiled C++ extension
-    from executorch.extension.llm.runner._llm_runner import (  # noqa: F401
-        GenerationConfig,
-        Image,
-        make_audio_input,
-        make_image_input,
-        make_raw_audio_input,
-        make_text_input,
-        make_token_input,
-        MultimodalInput,
-        MultimodalRunner,
-        Stats,
-        TextLLMRunner,
-    )
-except ImportError:
+    # Import shared components from the compiled C++ extension.
+    from executorch.extension.llm.runner import _llm_runner as _runner_mod
+except ImportError as exc:
     raise RuntimeError(
         "LLM runner is not installed. Please build ExecuTorch from source with EXECUTORCH_BUILD_PYBIND=ON"
-    )
+    ) from exc
+
+
+def _required_symbol(name: str):
+    value = getattr(_runner_mod, name, None)
+    if value is None:
+        raise RuntimeError(f"_llm_runner is missing required symbol: {name}")
+    return value
+
+
+GenerationConfig = _required_symbol("GenerationConfig")
+Image = _required_symbol("Image")
+make_text_input = _required_symbol("make_text_input")
+make_token_input = _required_symbol("make_token_input")
+MultimodalInput = _required_symbol("MultimodalInput")
+MultimodalRunner = _required_symbol("MultimodalRunner")
+Stats = _required_symbol("Stats")
+TextLLMRunner = _required_symbol("TextLLMRunner")
+
+# Optional helpers: stripped out in core-only builds.
+make_audio_input = getattr(_runner_mod, "make_audio_input", None)
+make_image_input = getattr(_runner_mod, "make_image_input", None)
+make_raw_audio_input = getattr(_runner_mod, "make_raw_audio_input", None)
 
 
 import logging
-from typing import Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
-from transformers.feature_extraction_utils import BatchFeature
+try:
+    from transformers.feature_extraction_utils import BatchFeature as _HF_BatchFeature
+except Exception:
+    _HF_BatchFeature = None
+
+
+def _require_torch():
+    try:
+        import torch
+
+        return torch
+    except Exception as exc:
+        raise RuntimeError(
+            "This API requires PyTorch (`torch`), but torch is not available in the current environment."
+        ) from exc
+
+
+def _is_batch_feature(value: object) -> bool:
+    return _HF_BatchFeature is not None and isinstance(value, _HF_BatchFeature)
 
 
 def _find_image_token_runs(
-    input_ids: torch.Tensor, image_token_id: Optional[int]
+    input_ids: Any, image_token_id: Optional[int]
 ) -> List[tuple[int, int, int]]:
     """Return contiguous runs (start, end, length) of image_token_id in input_ids.
 
@@ -68,7 +94,7 @@ def _find_image_token_runs(
 
 
 def _hf_to_multimodal_inputs(  # noqa: C901
-    inputs: BatchFeature, image_token_id: Optional[int] = None
+    inputs: Any, image_token_id: Optional[int] = None
 ) -> List[MultimodalInput]:
     """Convert a HuggingFace AutoProcessor dict to ExecuTorch MultimodalInputs.
     Currently only support 1 image inside the input.
@@ -89,6 +115,7 @@ def _hf_to_multimodal_inputs(  # noqa: C901
     if "input_ids" not in inputs:
         raise RuntimeError("HF inputs dict must contain 'input_ids' (torch.Tensor)")
 
+    torch = _require_torch()
     input_ids = inputs["input_ids"]
     if not isinstance(input_ids, torch.Tensor):
         raise RuntimeError("'input_ids' must be a torch.Tensor")
@@ -161,6 +188,11 @@ def _hf_to_multimodal_inputs(  # noqa: C901
         combined.append(make_token_input(input_ids[:first].to(torch.long).tolist()))
 
     # Use C++ checked creator for images (handles 3D/4D, CHW/HWC, uint8/float32)
+    if make_image_input is None:
+        raise RuntimeError(
+            "make_image_input is unavailable in this _llm_runner build. "
+            "Rebuild with EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER_TORCH_IO=ON for image/audio helpers."
+        )
     combined.append(make_image_input(inputs["pixel_values"]))
 
     if (last + 1) < input_ids.numel():
@@ -171,14 +203,14 @@ def _hf_to_multimodal_inputs(  # noqa: C901
 
 def generate_hf(
     runner: MultimodalRunner,
-    inputs: Union[BatchFeature, List[MultimodalInput]],
+    inputs: Union[Any, List[MultimodalInput]],
     config: GenerationConfig,
     image_token_id: Optional[int] = None,
     token_callback: Optional[Callable[[str], None]] = None,
     stats_callback: Optional[Callable[[Stats], None]] = None,
 ) -> None:
     """Generate using an BatchFeature by converting to multimodal inputs internally, or using a list of MultimodalInput."""
-    if isinstance(inputs, BatchFeature):
+    if _is_batch_feature(inputs):
         logging.info(
             "Input is a BatchFeature, assuming it's coming from HF AutoProcessor.apply_chat_template(). Converting to multimodal inputs."
         )
@@ -197,12 +229,12 @@ def generate_hf(
 
 def generate_text_hf(
     runner: MultimodalRunner,
-    inputs: Union[BatchFeature, List[MultimodalInput]],
+    inputs: Union[Any, List[MultimodalInput]],
     config: GenerationConfig,
     image_token_id: Optional[int] = None,
 ) -> str:
     """Generate using an BatchFeature by converting to multimodal inputs internally, or using a list of MultimodalInput."""
-    if isinstance(inputs, BatchFeature):
+    if _is_batch_feature(inputs):
         logging.info(
             "Input is a BatchFeature, assuming it's coming from HF AutoProcessor.apply_chat_template(). Converting to multimodal inputs."
         )
@@ -226,9 +258,6 @@ setattr(MultimodalRunner, "generate_text_hf", generate_text_hf)  # noqa B010
 __all__ = [
     "GenerationConfig",
     "Image",
-    "make_audio_input",
-    "make_image_input",
-    "make_raw_audio_input",
     "make_text_input",
     "make_token_input",
     "MultimodalInput",
@@ -236,3 +265,10 @@ __all__ = [
     "TextLLMRunner",
     "Stats",
 ]
+
+if make_image_input is not None:
+    __all__.append("make_image_input")
+if make_audio_input is not None:
+    __all__.append("make_audio_input")
+if make_raw_audio_input is not None:
+    __all__.append("make_raw_audio_input")

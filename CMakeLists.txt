@@ -158,6 +158,13 @@ announce_configured_options(BUILD_TESTING)
 load_build_preset()
 include(${PROJECT_SOURCE_DIR}/tools/cmake/preset/default.cmake)
 
+option(
+  EXECUTORCH_BUILD_EXSHADER_RUNTIME
+  "Build exshader runtime pybind module (_exshader_runtime)"
+  ON
+)
+announce_configured_options(EXECUTORCH_BUILD_EXSHADER_RUNTIME)
+
 # Enable ccache if available
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -1060,6 +1067,10 @@ endif()
 if(EXECUTORCH_BUILD_VULKAN)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/vulkan)
   list(APPEND _executorch_backends vulkan_backend vulkan_schema)
+endif()
+
+if(EXECUTORCH_BUILD_EXSHADER_RUNTIME AND EXECUTORCH_BUILD_PYBIND)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extension/exshader/runtime)
 endif()
 
 # Top-level interface targets.

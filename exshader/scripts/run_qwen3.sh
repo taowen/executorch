@@ -5,14 +5,27 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 source exshader/env.sh
+source exshader/scripts/common.sh
 
-PTE_NAME="${1:-qwen3_0_6b_vulkan_pure_candidate.pte}"
+PTE_NAME="$(exshader_resolve_qwen3_pte_name "$ET_PTE_DIR" "${1:-}" || true)"
 PROMPT="${2:-Write a short poem about Vulkan.}"
 PTE_PATH="$ET_PTE_DIR/$PTE_NAME"
 
-TOKENIZER_JSON=$(ls ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/tokenizer.json | head -n1)
+if [[ -z "${PTE_NAME:-}" ]]; then
+  echo "No Qwen3 PTE found under $ET_PTE_DIR" >&2
+  exit 1
+fi
+if [[ ! -f "$PTE_PATH" ]]; then
+  echo "PTE not found: $PTE_PATH" >&2
+  exit 1
+fi
 
-"$ET_BUILD_DIR/examples/models/llama/llama_main" \
-  --model_path "$PTE_PATH" \
-  --tokenizer_path "${TOKENIZER_JSON:?}" \
-  --prompt "$PROMPT"
+TOKENIZER_JSON="$(exshader_find_qwen3_tokenizer)"
+
+"$REPO_ROOT/.venv/bin/python" -m exshader.recipes.llm_decode \
+  --model "$PTE_PATH" \
+  --tokenizer "${TOKENIZER_JSON:?}" \
+  --prompt "$PROMPT" \
+  --max-new-tokens "${MAX_NEW_TOKENS:-64}" \
+  --temperature "${TEMPERATURE:-0.0}" \
+  --top-p "${TOP_P:-0.9}"

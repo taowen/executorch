@@ -37,6 +37,7 @@ _COMPILE_OPTIONS_ALLOWED_KEYS = {
     "disable_fuse_patterns",
     "disable_fuse_quantized_ops",
     "shader_bundle_path",
+    "enable_querypool",
 }
 
 
@@ -118,6 +119,7 @@ def _validate_vulkan_profile(profile: Dict[str, Any]) -> None:
         "force_fp16",
         "disable_fuse_patterns",
         "disable_fuse_quantized_ops",
+        "enable_querypool",
     }
     for key in bool_keys:
         value = compile_options.get(key)
