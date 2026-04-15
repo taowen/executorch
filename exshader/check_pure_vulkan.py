@@ -40,7 +40,7 @@ class PlanReport:
 
 
 def _repo_root_from_script(script_path: Path) -> Path:
-    # tools/et_tools/check_pure_vulkan.py -> repo root
+    # exshader/check_pure_vulkan.py -> repo root
     return script_path.resolve().parents[2]
 
 

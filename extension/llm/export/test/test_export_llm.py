@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from executorch.extension.llm.export.export_llm import (
+from exshader.export_llm import (
     main,
     parse_config_arg,
     pop_config_arg,
@@ -48,12 +48,12 @@ class TestExportLlm(unittest.TestCase):
         test_argv = ["export_llm.py", "debug.verbose=True"]
         with patch.object(sys, "argv", test_argv):
             with patch(
-                "executorch.extension.llm.export.export_llm.hydra_main"
+                "exshader.export_llm.hydra_main"
             ) as mock_hydra:
                 main()
                 mock_hydra.assert_called_once()
 
-    @patch("executorch.extension.llm.export.export_llm.export_llama")
+    @patch("executorch.examples.models.llama.export_llama_lib.export_llama")
     def test_with_config(self, mock_export_llama: MagicMock) -> None:
         """Test main function with --config file and no hydra args."""
         # Create a temporary config file
@@ -105,7 +105,7 @@ backend:
         finally:
             os.unlink(config_file)
 
-    @patch("executorch.extension.llm.export.export_llm.export_llama")
+    @patch("executorch.examples.models.llama.export_llama_lib.export_llama")
     def test_with_config_and_cli(self, mock_export_llama: MagicMock) -> None:
         """Test main function with --config file and no hydra args."""
         # Create a temporary config file

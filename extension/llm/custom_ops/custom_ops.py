@@ -11,6 +11,8 @@
 # pyre-unsafe
 
 import logging
+import os
+from pathlib import Path
 
 from typing import Tuple
 
@@ -22,28 +24,66 @@ from torch.library import impl
 
 aten = torch.ops.aten
 
+_CUSTOM_OPS_LIB_NAME = "libcustom_ops_aot_lib.so"
+
+
+def _repo_root_from(path: Path) -> Path:
+    for parent in path.parents:
+        if (parent / "src" / "executorch").is_dir() and (
+            parent / "CMakeLists.txt"
+        ).is_file():
+            return parent
+    raise RuntimeError(
+        f"Cannot locate ExecuTorch repo root from path: {path}. "
+        "Expected editable install from this workspace."
+    )
+
+
+def _resolve_custom_ops_aot_lib_path() -> Path:
+    env_lib = os.environ.get("EXECUTORCH_CUSTOM_OPS_AOT_LIB")
+    if env_lib:
+        env_path = Path(env_lib).expanduser().resolve()
+        if not env_path.exists():
+            raise RuntimeError(
+                "EXECUTORCH_CUSTOM_OPS_AOT_LIB is set but file does not exist: "
+                f"{env_path}"
+            )
+        return env_path
+
+    repo_root = _repo_root_from(Path(__file__).resolve())
+    candidates = [
+        repo_root
+        / "cmake-out-linux-vulkan"
+        / "extension"
+        / "llm"
+        / "custom_ops"
+        / _CUSTOM_OPS_LIB_NAME,
+        repo_root / "cmake-out-linux-vulkan" / _CUSTOM_OPS_LIB_NAME,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise RuntimeError(
+        f"{_CUSTOM_OPS_LIB_NAME} not found. Build with:\n"
+        "  cmake -S . -B cmake-out-linux-vulkan "
+        "-DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON "
+        "-DEXECUTORCH_BUILD_KERNELS_LLM=ON "
+        "-DEXECUTORCH_BUILD_KERNELS_LLM_AOT=ON\n"
+        "  cmake --build cmake-out-linux-vulkan --target custom_ops_aot_lib -j$(nproc)\n"
+        "Or set EXECUTORCH_CUSTOM_OPS_AOT_LIB=/abs/path/to/libcustom_ops_aot_lib.so."
+    )
+
+
 try:
     op = torch.ops.llama.sdpa_with_kv_cache.default
     assert op is not None
     op2 = torch.ops.llama.fast_hadamard_transform.default
     assert op2 is not None
-except:
-    # This is needed to ensure that custom ops are registered
-    from executorch.extension.pybindings import portable_lib  # noqa # usort: skip
-
-    # Ideally package is installed in only one location but usage of
-    # PYATHONPATH can result in multiple locations.
-    # ATM this is mainly used in CI for qnn runner. Will need to revisit this
-    from pathlib import Path
-
-    package_path = Path(__file__).parent.resolve()
-    logging.info(f"Looking for libcustom_ops_aot_lib.so in {package_path}")
-
-    libs = list(package_path.glob("**/*custom_ops_aot_lib.*"))
-
-    assert len(libs) == 1, f"Expected 1 library but got {len(libs)}"
-    logging.info(f"Loading custom ops library: {libs[0]}")
-    torch.ops.load_library(libs[0])
+except (AttributeError, RuntimeError, AssertionError):
+    lib_path = _resolve_custom_ops_aot_lib_path()
+    logging.info(f"Loading custom ops library: {lib_path}")
+    torch.ops.load_library(str(lib_path))
     op = torch.ops.llama.sdpa_with_kv_cache.default
     assert op is not None
     op2 = torch.ops.llama.fast_hadamard_transform.default

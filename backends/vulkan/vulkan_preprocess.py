@@ -122,6 +122,15 @@ def parse_compile_spec(compile_specs: List[CompileSpec]) -> Dict[str, Any]:
         if spec.key == "force_fp16":
             options[spec.key] = bool.from_bytes(spec.value, byteorder="little")
 
+        if spec.key == "disable_fuse_patterns":
+            options[spec.key] = bool.from_bytes(spec.value, byteorder="little")
+
+        if spec.key == "disable_fuse_quantized_ops":
+            options[spec.key] = bool.from_bytes(spec.value, byteorder="little")
+
+        if spec.key == "shader_bundle_path":
+            options[spec.key] = spec.value.decode("utf-8")
+
         # Unhandled options are ignored
 
     return options
@@ -168,22 +177,34 @@ class VulkanBackend(BackendDetails):
         # First, apply passes that fuse/remove operators to consolidate the graph
         # structure but still preserve an "ATen-compliant" graph structure (i.e. all
         # arguments to ATen operators must match the ATen function schema).
-        program = apply_passes(
-            program,
+        pre_aten_passes = [
+            AddmmToLinearTransform(),
+            FuseBatchNormPass(program),
+            AddmmToLinearTransform(),
+            InsertDtypePromotionPass(),
+        ]
+        if not compile_options.get("disable_fuse_patterns", False):
+            pre_aten_passes.append(FusePatternsPass())
+        pre_aten_passes.extend(
             [
-                AddmmToLinearTransform(),
-                FuseBatchNormPass(program),
-                AddmmToLinearTransform(),
-                InsertDtypePromotionPass(),
-                FusePatternsPass(),
                 FuseClampPass(),
                 RemoveRedundantOpsTransform(),
-                FuseQuantizedOpsTransform(),
+            ]
+        )
+        if not compile_options.get("disable_fuse_quantized_ops", False):
+            pre_aten_passes.append(FuseQuantizedOpsTransform())
+        pre_aten_passes.extend(
+            [
                 FoldQDQPass(),
                 SqueezeUnsqueezeInputs(),
                 FuseViewCopyTransform(),
                 ViewCopyToSqueezeUnsqueezePass(),
-            ],
+            ]
+        )
+
+        program = apply_passes(
+            program,
+            pre_aten_passes,
         )
 
         # Next annotate tensor nodes with TensorSpec structs which is needed for dynamic

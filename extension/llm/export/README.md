@@ -30,7 +30,7 @@ The export API supports a Hydra-style CLI where you can you configure using yaml
 Use structured configuration arguments directly on the command line:
 
 ```bash
-python -m extension.llm.export.export_llm \
+python -m exshader.export_llm \
     base.model_class=llama3 \
     model.use_sdpa_with_kv_cache=True \
     model.use_kv_cache=True \
@@ -46,7 +46,7 @@ python -m extension.llm.export.export_llm \
 Create a YAML configuration file and reference it:
 
 ```bash
-python -m extension.llm.export.export_llm --config my_config.yaml
+python -m exshader.export_llm --config my_config.yaml
 ```
 
 Example `my_config.yaml`:
@@ -81,7 +81,7 @@ debug:
 You can you also still provide additional overrides using the CLI args as well:
 
 ```bash
-python -m extension.llm.export.export_llm
+python -m exshader.export_llm
   --config my_config.yaml
   base.model_class="llama2"
   +export.max_context_length=1024

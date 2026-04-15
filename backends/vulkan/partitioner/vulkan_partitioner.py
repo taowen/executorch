@@ -294,6 +294,10 @@ def parse_compile_options(compile_options: Dict[str, Any]) -> List[CompileSpec]:
             value_bytes = value.to_bytes(1, byteorder="little")
             compile_specs.append(CompileSpec(key, value_bytes))
 
+        if isinstance(value, str):
+            value_bytes = value.encode("utf-8")
+            compile_specs.append(CompileSpec(key, value_bytes))
+
         if key == "texture_limits":
             compile_specs.append(
                 CompileSpec(

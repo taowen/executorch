@@ -81,3 +81,9 @@ xcuserdata/
 extension/pybindings/mlx.metallib
 outputs/
 uv.lock
+
+# Local pure-vulkan artifacts
+artifacts/
+vk_bundle*/
+*.spv
+bundle.tsv

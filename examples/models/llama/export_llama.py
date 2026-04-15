@@ -43,9 +43,7 @@ def main() -> None:
         # under the Hydra framework.
         sys.argv = [arg for arg in sys.argv if arg != "--hydra"]
         print(f"running with {sys.argv}")
-        runpy.run_module(
-            "executorch.extension.llm.export.export_llm", run_name="__main__"
-        )
+        runpy.run_module("exshader.export_llm", run_name="__main__")
     else:
         parser = build_args_parser()
         remaining_args = parser.parse_args(remaining_args)

@@ -12,10 +12,14 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
-from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
-    get_symmetric_quantization_config as get_symmetric_quantization_config_xnnpack,
-    XNNPACKQuantizer,
-)
+try:
+    from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
+        get_symmetric_quantization_config as get_symmetric_quantization_config_xnnpack,
+        XNNPACKQuantizer,
+    )
+except ModuleNotFoundError:
+    get_symmetric_quantization_config_xnnpack = None
+    XNNPACKQuantizer = None
 
 from torchao.quantization.pt2e.quantizer import Quantizer
 from torchao.quantization.pt2e.quantizer.embedding_quantizer import EmbeddingQuantizer
@@ -121,6 +125,13 @@ def get_pt2e_quantizers(
         quantizers.append(EmbeddingQuantizer())
     if quant_params is not None and quant_params.quantize_linear is not None:
         logging.info("Apply PT2E dynamic linear quantization.")
+        if (
+            XNNPACKQuantizer is None
+            or get_symmetric_quantization_config_xnnpack is None
+        ):
+            raise RuntimeError(
+                "xnnpack_dynamic PT2E quantization requested, but XNNPACK quantizer is unavailable in this branch."
+            )
         dynamic_quantizer = XNNPACKQuantizer()
         assert quant_params.quantize_linear is not None
         if not quant_params.quantize_linear.is_per_channel:

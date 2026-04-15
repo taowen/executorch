@@ -20,7 +20,12 @@ import torch
 from executorch.backends.transforms.duplicate_dynamic_quant_chain import (
     DuplicateDynamicQuantChainPass,
 )
-from executorch.backends.xnnpack._passes.convert_to_linear import ConvertToLinearPass
+try:
+    from executorch.backends.xnnpack._passes.convert_to_linear import (
+        ConvertToLinearPass,
+    )
+except ModuleNotFoundError:
+    ConvertToLinearPass = None
 from executorch.exir import EdgeProgramManager, to_edge_transform_and_lower
 from executorch.exir.backend.partitioner import Partitioner
 
@@ -500,7 +505,10 @@ class LLMEdgeManager:
         # TODO: ConvertToLinearPass is not a sound pass and must be called before
         # const propagation.  It requires fixing:
         # https://github.com/pytorch/executorch/issues/10499
-        self.edge_manager.transform([ConvertToLinearPass()])
+        if ConvertToLinearPass is not None:
+            self.edge_manager.transform([ConvertToLinearPass()])
+        else:
+            logging.info("Skipping ConvertToLinearPass: XNNPACK pass not available.")
 
         self.export_program = self.edge_manager.to_executorch(
             ExecutorchBackendConfig(

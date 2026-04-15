@@ -14,6 +14,7 @@
 
 #include <executorch/backends/vulkan/runtime/graph/ops/OperatorRegistry.h>
 
+#include <executorch/backends/vulkan/runtime/api/ShaderRegistry.h>
 #include <executorch/backends/vulkan/runtime/vk_api/Runtime.h>
 
 #include <executorch/runtime/backend/interface.h>
@@ -202,6 +203,24 @@ GraphConfig get_graph_config(ArrayRef<CompileSpec>& compile_specs) {
   config.enable_querypool = true;
 #endif // ET_EVENT_TRACER_ENABLED
   return config;
+}
+
+std::string get_compile_spec_str(const CompileSpec& spec) {
+  const char* value_data = reinterpret_cast<const char*>(spec.value.buffer);
+  size_t value_size = spec.value.nbytes;
+  while (value_size > 0 && value_data[value_size - 1] == '\0') {
+    --value_size;
+  }
+  return std::string(value_data, value_size);
+}
+
+std::string get_shader_bundle_path(ArrayRef<CompileSpec>& compile_specs) {
+  for (const CompileSpec& spec : compile_specs) {
+    if (strcmp(spec.key, "shader_bundle_path") == 0) {
+      return get_compile_spec_str(spec);
+    }
+  }
+  return std::string();
 }
 
 class GraphBuilder {
@@ -638,6 +657,23 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
       BackendInitContext& context,
       FreeableBuffer* processed,
       ArrayRef<CompileSpec> compile_specs) const override {
+    std::string shader_bundle_path = get_shader_bundle_path(compile_specs);
+    if (!shader_bundle_path.empty()) {
+      std::string error_msg;
+      if (!api::shader_registry().load_bundle(shader_bundle_path, &error_msg)) {
+        ET_LOG(
+            Error,
+            "Failed to load Vulkan shader bundle from %s: %s",
+            shader_bundle_path.c_str(),
+            error_msg.c_str());
+        return Error::InvalidArgument;
+      }
+      ET_LOG(
+          Info,
+          "Loaded Vulkan shader bundle from %s",
+          shader_bundle_path.c_str());
+    }
+
     ComputeGraph* compute_graph =
         context.get_runtime_allocator()->allocateInstance<ComputeGraph>();
     if (compute_graph == nullptr) {

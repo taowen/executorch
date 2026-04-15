@@ -15,7 +15,7 @@ Export an LLM with ExecuTorch. Currently follows the following steps:
 7. Export to final ExecuTorch .pte format.
 
 Example usage using full CLI arguments:
-python -m extension.llm.export.export_llm \
+python -m exshader.export_llm \
     base.model_class="llama3" \
     model.use_sdpa_with_kv_cache=True \
     model.use_kv_cache=True \
@@ -25,17 +25,18 @@ python -m extension.llm.export.export_llm \
     quantization.qmode="8da4w"
 
 Example usage using config file:
-python -m extension.llm.export.export_llm \
+python -m exshader.export_llm \
     --config example_llm_config.yaml
 """
 
 import argparse
+import importlib.util
 import os
 import sys
+from pathlib import Path
 from typing import Any, List, Tuple
 
 import hydra
-from executorch.examples.models.llama.export_llama_lib import export_llama
 
 from executorch.extension.llm.export.config.llm_config import LlmConfig
 from hydra.core.config_store import ConfigStore
@@ -43,6 +44,72 @@ from omegaconf import OmegaConf
 
 cs = ConfigStore.instance()
 cs.store(name="llm_config", node=LlmConfig)
+
+
+def _repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "CMakeLists.txt").exists() and (parent / "src" / "executorch").is_dir():
+            return parent
+    raise RuntimeError(f"Cannot locate repo root from {here}")
+
+
+def _resolve_build_dir(repo_root: Path) -> Path:
+    env_build_dir = os.environ.get("ET_BUILD_DIR")
+    if env_build_dir:
+        return Path(env_build_dir).expanduser().resolve()
+    return repo_root / "cmake-out-linux-vulkan"
+
+
+def _assert_module_from_repo(module_name: str, repo_root: Path) -> None:
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        raise RuntimeError(f"Cannot resolve required module: {module_name}")
+    origin = Path(spec.origin).resolve()
+    if repo_root not in origin.parents and origin != repo_root:
+        raise RuntimeError(
+            f"{module_name} resolved to '{origin}', not local repo '{repo_root}'. "
+            "Run: `uv pip install -e .` to use the current workspace source."
+        )
+
+
+def _assert_custom_ops_aot_lib_ready(repo_root: Path) -> None:
+    env_path = os.environ.get("EXECUTORCH_CUSTOM_OPS_AOT_LIB")
+    if env_path:
+        if not Path(env_path).expanduser().resolve().exists():
+            raise RuntimeError(
+                f"EXECUTORCH_CUSTOM_OPS_AOT_LIB is set but file does not exist: {env_path}"
+            )
+        return
+
+    build_dir = _resolve_build_dir(repo_root)
+    candidates = [
+        build_dir / "extension" / "llm" / "custom_ops" / "libcustom_ops_aot_lib.so",
+        build_dir / "libcustom_ops_aot_lib.so",
+    ]
+    if any(path.exists() for path in candidates):
+        return
+
+    raise RuntimeError(
+        "Missing libcustom_ops_aot_lib.so. Build it before export:\n"
+        "  source exshader/env.sh\n"
+        "  cmake -S . -B \"$ET_BUILD_DIR\" "
+        "-DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON "
+        "-DEXECUTORCH_BUILD_KERNELS_LLM=ON "
+        "-DEXECUTORCH_BUILD_KERNELS_LLM_AOT=ON\n"
+        "  cmake --build \"$ET_BUILD_DIR\" --target custom_ops_aot_lib -j$(nproc)"
+    )
+
+
+def _validate_export_environment() -> None:
+    repo_root = _repo_root()
+    for module_name in (
+        "executorch.extension.llm.export.partitioner_lib",
+        "executorch.examples.models.llama.export_llama_lib",
+        "executorch.backends.vulkan.partitioner.vulkan_partitioner",
+    ):
+        _assert_module_from_repo(module_name, repo_root)
+    _assert_custom_ops_aot_lib_ready(repo_root)
 
 
 def parse_config_arg() -> Tuple[str, List[Any]]:
@@ -82,6 +149,9 @@ def add_hydra_config_args(config_file_path: str) -> None:
 
 @hydra.main(version_base=None, config_name="llm_config", config_path=None)
 def hydra_main(llm_config: LlmConfig) -> None:
+    _validate_export_environment()
+    from executorch.examples.models.llama.export_llama_lib import export_llama
+
     structured = OmegaConf.structured(LlmConfig)
     merged = OmegaConf.merge(structured, llm_config)
     llm_config_obj = OmegaConf.to_object(merged)

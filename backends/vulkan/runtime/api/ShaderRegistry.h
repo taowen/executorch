@@ -14,6 +14,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #define VK_KERNEL(shader_name) \
   ::vkcompute::api::shader_registry().get_shader_info(#shader_name)
@@ -39,6 +40,7 @@ class ShaderRegistry final {
   ShaderListing listings_;
   Dispatcher dispatcher_;
   Registry registry_;
+  std::unordered_map<std::string, std::vector<uint32_t>> owned_shader_binaries_;
 
  public:
   /*
@@ -57,6 +59,14 @@ class ShaderRegistry final {
   void register_shader(vkapi::ShaderInfo&& shader_info);
 
   /*
+   * Upsert ShaderInfo and own the provided SPIR-V binary.
+   * Existing shaders with the same name are replaced.
+   */
+  void upsert_shader(
+      vkapi::ShaderInfo&& shader_info,
+      std::vector<uint32_t>&& spirv_binary);
+
+  /*
    * Register a dispatch entry to the given op name
    */
   void register_op_dispatch(
@@ -68,6 +78,12 @@ class ShaderRegistry final {
    * Given a shader name, return the ShaderInfo which contains the SPIRV binary
    */
   const vkapi::ShaderInfo& get_shader_info(const std::string& shader_name);
+
+  /*
+   * Load and register shaders from an external bundle directory.
+   * The bundle must contain a `bundle.tsv` manifest and referenced .spv files.
+   */
+  bool load_bundle(const std::string& bundle_dir, std::string* error_msg = nullptr);
 };
 
 class ShaderRegisterInit final {

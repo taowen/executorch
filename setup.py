@@ -239,13 +239,36 @@ class _BaseExtension(Extension):
             # try to find it under the current directory.
             return Path(".")
 
+    def _get_cmake_cache_path(self, installer: "InstallerBuildExt") -> Optional[Path]:
+        """Returns the CMakeCache path for evaluating dependent flags.
+
+        Prefer the cache produced by the `build` command when available, even for
+        source-tree files whose src path does not contain %CMAKE_CACHE_DIR%.
+        """
+        build_cmd = installer.get_finalized_command("build")
+        if hasattr(build_cmd, "cmake_cache_dir"):
+            build_cache_path = Path(build_cmd.cmake_cache_dir) / "CMakeCache.txt"
+            if build_cache_path.exists():
+                return build_cache_path
+
+        fallback_cache_path = self._get_build_dir(installer) / "CMakeCache.txt"
+        if fallback_cache_path.exists():
+            return fallback_cache_path
+
+        return None
+
     def is_cmake_artifact_used(self, installer: "InstallerBuildExt") -> bool:
-        cache_path = str(self._get_build_dir(installer) / "CMakeCache.txt")
-        if not os.path.exists(cache_path):
-            # If this is not a CMake folder, then assume it's used.
+        if not self.dependent_cmake_flags:
             return True
-        elif self.cmake_cache is None:
-            self.cmake_cache = CMakeCache(cache_path=cache_path)
+
+        cache_path = self._get_cmake_cache_path(installer)
+        if cache_path is None:
+            # Without cache data we cannot evaluate dependent flags reliably.
+            # Fail-closed for conditional artifacts to avoid spurious installs.
+            return False
+
+        if self.cmake_cache is None or self.cmake_cache.cache_path != str(cache_path):
+            self.cmake_cache = CMakeCache(cache_path=str(cache_path))
 
         return all(
             self.cmake_cache.is_enabled(flag) for flag in self.dependent_cmake_flags
@@ -922,7 +945,7 @@ setup(
             src_dir="backends/cuda/runtime/",
             src_name="aoti_cuda_shims.lib",
             dst="executorch/data/lib/",
-            dependent_cmake_flags=[],
+            dependent_cmake_flags=["EXECUTORCH_BUILD_CUDA"],
         ),
         BuiltFile(
             src_dir="%CMAKE_CACHE_DIR%/backends/cuda/%BUILD_TYPE%/",
