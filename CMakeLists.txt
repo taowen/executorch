@@ -14,9 +14,7 @@
 # cloning or pulling the upstream repo. Once this is done, you don't need to do
 # it again until you pull from the upstream repo again.
 #
-# NOTE: Build options can be configured by passing arguments to cmake. For
-# example, to enable the EXECUTORCH_BUILD_XNNPACK option, change the cmake
-# command to 'cmake -DEXECUTORCH_BUILD_XNNPACK=ON ..'.
+# NOTE: Build options can be configured by passing arguments to cmake.
 #[[
   (rm -rf cmake-out \
     && mkdir cmake-out \
@@ -195,10 +193,6 @@ endif()
 
 if(EXECUTORCH_ENABLE_BUNDLE_IO)
   add_definitions(-DET_BUNDLE_IO_ENABLED)
-endif()
-
-if(EXECUTORCH_BUILD_CUDA)
-  add_definitions(-DCUDA_AVAILABLE=1)
 endif()
 
 # -ffunction-sections -fdata-sections: breaks function and data into sections so
@@ -683,104 +677,39 @@ install(FILES tools/cmake/executorch-config.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ExecuTorch
 )
 
-if(EXECUTORCH_BUILD_ARM_BAREMETAL
-   OR EXECUTORCH_BUILD_ARM_ETHOSU_LINUX
-   OR EXECUTORCH_BUILD_VGF
+set(_pruned_non_vulkan_backends
+    EXECUTORCH_BUILD_ARM_BAREMETAL
+    EXECUTORCH_BUILD_ARM_ETHOSU_LINUX
+    EXECUTORCH_BUILD_CADENCE
+    EXECUTORCH_BUILD_COREML
+    EXECUTORCH_BUILD_CORTEX_M
+    EXECUTORCH_BUILD_CUDA
+    EXECUTORCH_BUILD_ENN
+    EXECUTORCH_BUILD_METAL
+    EXECUTORCH_BUILD_MLX
+    EXECUTORCH_BUILD_MPS
+    EXECUTORCH_BUILD_NEURON
+    EXECUTORCH_BUILD_NXP_NEUTRON
+    EXECUTORCH_BUILD_NXP_NEUTRON_RUNNER
+    EXECUTORCH_BUILD_OPENVINO
+    EXECUTORCH_BUILD_QNN
+    EXECUTORCH_BUILD_VGF
+    EXECUTORCH_BUILD_XNNPACK
 )
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/arm)
-endif()
-
-if(EXECUTORCH_BUILD_ARM_BAREMETAL OR EXECUTORCH_BUILD_ARM_ETHOSU_LINUX)
-  list(APPEND _executorch_backends executorch_delegate_ethos_u)
-endif()
-
-if(EXECUTORCH_BUILD_CADENCE)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/cadence)
-endif()
-
-if(EXECUTORCH_BUILD_NXP_NEUTRON)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/nxp)
-  list(APPEND _executorch_backends executorch_delegate_neutron)
-endif()
-
-if(EXECUTORCH_BUILD_NXP_NEUTRON_RUNNER)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/examples/nxp/executor_runner)
-endif()
-
-if(EXECUTORCH_BUILD_COREML)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/apple/coreml)
-  list(APPEND _executorch_backends coremldelegate)
-endif()
-
-if(EXECUTORCH_BUILD_MPS)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/apple/mps)
-  list(APPEND _executorch_backends mpsdelegate)
-endif()
-
-if(EXECUTORCH_BUILD_MLX)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/mlx)
-  list(APPEND _executorch_backends mlxdelegate)
-endif()
-
-if(EXECUTORCH_BUILD_NEURON)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/mediatek)
-  list(APPEND _executorch_backends neuron_backend)
-endif()
-
-if(EXECUTORCH_BUILD_OPENVINO)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/openvino)
-  list(APPEND _executorch_backends openvino_backend)
-endif()
-
-if(EXECUTORCH_BUILD_QNN)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/qualcomm)
-  list(APPEND _executorch_backends qnn_executorch_backend)
-endif()
-
-if(EXECUTORCH_BUILD_ENN)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/samsung)
-  list(APPEND _executorch_backends enn_backend)
-endif()
-
-if(EXECUTORCH_BUILD_XNNPACK)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/xnnpack)
-  list(APPEND _executorch_backends xnnpack_backend)
-endif()
-
-if(EXECUTORCH_BUILD_CORTEX_M)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/cortex_m)
-endif()
+foreach(_backend_flag IN LISTS _pruned_non_vulkan_backends)
+  if(${_backend_flag})
+    message(
+      FATAL_ERROR
+        "This pruned tree supports Vulkan backend only. Set ${_backend_flag}=OFF."
+    )
+  endif()
+endforeach()
 
 # If CUDA, Metal, or pybind will need Torch, find it at root scope first so that
 # imported targets (e.g. MKL::MKL) aren't created in child directory scopes and
 # then duplicated when found again at root scope.
-if(EXECUTORCH_BUILD_CUDA
-   OR EXECUTORCH_BUILD_METAL
-   OR EXECUTORCH_BUILD_PYBIND
-)
+if(EXECUTORCH_BUILD_PYBIND)
   find_package_torch()
-endif()
-
-# Build common AOTI functionality if needed by CUDA or Metal backends
-if(EXECUTORCH_BUILD_CUDA OR EXECUTORCH_BUILD_METAL)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/aoti)
-endif()
-
-if(EXECUTORCH_BUILD_CUDA)
-  # Build CUDA-specific AOTI functionality
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/cuda)
-  # Add aoti_cuda_backend to backends - it transitively includes aoti_cuda_shims
-  # and cuda_platform
-  list(APPEND _executorch_backends aoti_cuda_backend)
-endif()
-
-if(EXECUTORCH_BUILD_METAL)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/apple/metal)
-  list(APPEND _executorch_backends metal_backend)
-endif()
-
-if(EXECUTORCH_BUILD_EXTENSION_APPLE)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extension/apple)
 endif()
 
 if(EXECUTORCH_BUILD_EXTENSION_DATA_LOADER)
@@ -910,10 +839,8 @@ if(EXECUTORCH_BUILD_KERNELS_TORCHAO)
     INCLUDES
     DESTINATION ${_common_include_directories}
   )
-  # If using KleidiAI and XNNPACK has not installed it already, install it
-  if(TORCHAO_BUILD_KLEIDIAI AND NOT (EXECUTORCH_BUILD_XNNPACK
-                                     AND EXECUTORCH_XNNPACK_ENABLE_KLEIDI)
-  )
+  # In this pruned tree XNNPACK backend is disabled, so TorchAO installs KleidiAI.
+  if(TORCHAO_BUILD_KLEIDIAI)
     install(
       TARGETS kleidiai
       EXPORT ExecuTorchTargets
@@ -983,14 +910,6 @@ if(EXECUTORCH_BUILD_PYBIND)
   )
 
   # Build common AOTI functionality if needed by CUDA or Metal backends
-  if(EXECUTORCH_BUILD_CUDA)
-    # CUDA uses SlimTensor-based shims
-    list(APPEND _dep_libs aoti_cuda_backend)
-  elseif(EXECUTORCH_BUILD_METAL)
-    # Metal still uses ETensor-based shims (for now)
-    list(APPEND _dep_libs aoti_common)
-  endif()
-
   # RPATH for _portable_lib.so
   set(_portable_lib_rpath "$ORIGIN/../../../torch/lib")
 
@@ -1012,41 +931,6 @@ if(EXECUTORCH_BUILD_PYBIND)
     list(APPEND _dep_libs optimized_native_cpu_ops_lib)
   else()
     list(APPEND _dep_libs portable_ops_lib)
-  endif()
-
-  if(EXECUTORCH_BUILD_COREML AND APPLE)
-    list(APPEND _dep_libs coremldelegate)
-  endif()
-
-  if(EXECUTORCH_BUILD_MPS)
-    list(APPEND _dep_libs mpsdelegate)
-  endif()
-
-  if(EXECUTORCH_BUILD_MLX)
-    list(APPEND _dep_libs mlxdelegate)
-  endif()
-
-  if(EXECUTORCH_BUILD_OPENVINO)
-    list(APPEND _dep_libs openvino_backend)
-  endif()
-
-  if(EXECUTORCH_BUILD_CUDA)
-    string(APPEND _portable_lib_rpath ":$ORIGIN/../../backends/cuda")
-  endif()
-
-  if(EXECUTORCH_BUILD_QNN)
-    list(APPEND _dep_libs qnn_executorch_backend)
-    string(APPEND _portable_lib_rpath ":$ORIGIN/../../backends/qualcomm")
-  endif()
-
-  if(EXECUTORCH_BUILD_ENN)
-    list(APPEND _dep_libs enn_backend)
-  endif()
-
-  if(EXECUTORCH_BUILD_XNNPACK)
-    # need to explicitly specify XNNPACK and xnnpack-microkernels-prod here
-    # otherwise uses XNNPACK and microkernel-prod symbols from libtorch_cpu
-    list(APPEND _dep_libs xnnpack_backend XNNPACK xnnpack-microkernels-prod)
   endif()
 
   if(EXECUTORCH_BUILD_VULKAN)
@@ -1178,10 +1062,6 @@ if(EXECUTORCH_BUILD_VULKAN)
   list(APPEND _executorch_backends vulkan_backend vulkan_schema)
 endif()
 
-if(EXECUTORCH_BUILD_VGF)
-  list(APPEND _executorch_backends vgf_backend)
-endif()
-
 # Top-level interface targets.
 
 # A target containing all configured backends.
@@ -1283,8 +1163,6 @@ if(EXECUTORCH_BUILD_EXECUTOR_RUNNER)
 
   if(EXECUTORCH_BUILD_KERNELS_OPTIMIZED)
     list(APPEND _executor_runner_libs optimized_native_cpu_ops_lib)
-  elseif(EXECUTORCH_BUILD_CADENCE)
-    list(APPEND _executor_runner_libs cadence_ops_lib)
   else()
     list(APPEND _executor_runner_libs portable_ops_lib)
   endif()
@@ -1312,21 +1190,6 @@ if(EXECUTORCH_BUILD_EXECUTOR_RUNNER)
   endif()
   target_link_libraries(executor_runner PRIVATE ${_executor_runner_libs})
   target_compile_options(executor_runner PUBLIC ${_common_compile_options})
-  if(EXECUTORCH_BUILD_ARM_ETHOSU_LINUX)
-    target_compile_definitions(
-      executor_runner PRIVATE EXECUTORCH_BUILD_ARM_ETHOSU_LINUX=1
-    )
-    target_link_libraries(
-      executor_runner
-      PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,executorch_delegate_ethos_u>
-    )
-    # Wrap static linking like the delegate_runner to keep images
-    # self-contained.
-    target_link_options(
-      executor_runner PRIVATE -static-libstdc++ -static-libgcc
-    )
-  endif()
-
   # Automatically set when using `emcmake cmake` for Wasm build.
   if(EMSCRIPTEN)
     # Directory of model pte files to embed in the wasm binary.
