@@ -14,6 +14,57 @@
 4. `tools/` 冻结：新增能力放 `exshader/` 或已有主链目录。
 5. 不为具体任务扩散专用 C++ runner。
 
+## Environment Bootstrap
+环境必须满足“两件事同时成立”：
+1. 命令从 `/home/taowen/projects/exshader` 根目录运行。
+2. `.venv` 里的 `executorch` editable install 必须指向当前仓库，而不是别的 checkout。
+
+推荐的干净重建流程：
+1. `cd /home/taowen/projects/exshader`
+2. `uv venv --seed --clear .venv`
+3. `./.venv/bin/python install_requirements.py --example`
+4. `CMAKE_ARGS='-DEXECUTORCH_BUILD_VULKAN=ON -DEXECUTORCH_BUILD_XNNPACK=OFF -DEXECUTORCH_BUILD_COREML=OFF -DEXECUTORCH_BUILD_OPENVINO=OFF -DEXECUTORCH_BUILD_QNN=OFF -DEXECUTORCH_BUILD_TESTS=OFF -DEXECUTORCH_BUILD_EXTENSION_LLM=ON -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON -DEXECUTORCH_BUILD_EXTENSION_NAMED_DATA_MAP=ON -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON -DEXECUTORCH_BUILD_EXSHADER_RUNTIME=ON -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON -DEXECUTORCH_BUILD_KERNELS_LLM=ON -DEXECUTORCH_BUILD_KERNELS_LLM_AOT=ON' ./.venv/bin/python -m pip install --no-build-isolation -e .`
+5. `exshader/scripts/build_vulkan.sh --clean`
+6. `source exshader/env.sh`
+
+必要说明：
+1. 这棵树是 Vulkan-only，editable install 不能走默认 `pybind` preset 配置；默认会把 `EXECUTORCH_BUILD_XNNPACK` 打开，直接触发根目录 `CMakeLists.txt` 的 pruned-tree 校验失败。
+2. 仅仅传 `-DEXECUTORCH_BUILD_VULKAN=ON -DEXECUTORCH_BUILD_XNNPACK=OFF` 还不够。Qwen 主链实际依赖 `build_vulkan.sh` 那套完整开关，尤其是：
+   - `EXECUTORCH_BUILD_EXSHADER_RUNTIME=ON`
+   - `EXECUTORCH_BUILD_EXTENSION_LLM=ON`
+   - `EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON`
+   - `EXECUTORCH_BUILD_EXTENSION_MODULE=ON`
+   - `EXECUTORCH_BUILD_EXTENSION_TENSOR=ON`
+   - `EXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON`
+   - `EXECUTORCH_BUILD_KERNELS_LLM=ON`
+   - `EXECUTORCH_BUILD_KERNELS_LLM_AOT=ON`
+3. 如果 `extension/llm/tokenizers` 安装时抱怨 CMake cache 指向别的仓库，先删：
+   - `extension/llm/tokenizers/build`
+   - `third-party/ao/build`
+   然后重跑安装。
+4. `.venv` 重建以后，优先跟一次 `exshader/scripts/build_vulkan.sh --clean`，避免 Python 绑定和旧的 Vulkan 产物错配。
+5. 环境修好以后，不应该再依赖 `PYTHONPATH="$PWD/src:$PWD"` 这种临时覆盖；它只适合拿来快速确认“当前 `.venv` 是否串仓库了”。
+
+每次重建后先做自检：
+1. `./.venv/bin/python - <<'PY'`
+   `import importlib.util`
+   `mods = [`
+   `    "executorch.examples.models.llama.runner.native",`
+   `    "executorch.extension.llm.export.partitioner_lib",`
+   `    "executorch.backends.vulkan.partitioner.vulkan_partitioner",`
+   `]`
+   `for m in mods:`
+   `    spec = importlib.util.find_spec(m)`
+   `    print(m, "->", spec.origin if spec else None)`
+   `PY`
+2. `cat .venv/lib/python3.12/site-packages/executorch-*.dist-info/direct_url.json`
+
+正确结果必须全部指向：
+1. `/home/taowen/projects/exshader/...`
+2. `file:///home/taowen/projects/exshader`
+
+如果看到的是 `/home/taowen/projects/executorch/...`，说明 `.venv` 已污染，直接重建，不要继续调模型或 runtime。
+
 ## Validated State
 当前已经验证的模型路径：
 1. `qwen3_0_6b`

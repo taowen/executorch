@@ -63,7 +63,7 @@ void add_rms_norm_node(
     const ValueRef weight_data,
     const ValueRef eps,
     const ValueRef out) {
-  ValueRef arg_weight = prepack_standard_like(graph, weight_data, in);
+  ValueRef arg_weight = prepack_standard_like(graph, weight_data, in, true);
 
   float epsilon = graph.extract_scalar<float>(eps);
 

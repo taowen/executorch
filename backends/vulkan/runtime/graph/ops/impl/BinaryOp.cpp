@@ -10,6 +10,7 @@
 
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Common.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Staging.h>
+#include <executorch/backends/vulkan/runtime/graph/ops/impl/View.h>
 
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/utils/ScalarUtils.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/utils/TensorUtils.h>
@@ -42,9 +43,22 @@ void resize_binary_op_node(
   (void)resize_args;
   const ValueRef out = args.at(0).refs.at(0);
 
+  const auto& input_refs = args.at(1).refs;
+  if (input_refs.empty()) {
+    VK_THROW("binary op resize expects at least one input tensor ref");
+  }
+
+  // Scalar binary kernels only carry a single tensor input in the read arg
+  // group. The scalar does not affect output shape, so the output shape is the
+  // tensor input shape.
+  if (input_refs.size() == 1) {
+    graph->virtual_resize(out, graph->sizes_of(input_refs.at(0)));
+    return;
+  }
+
   // TODO(T183442143): Verify tensors are broadcastable.
-  const ValueRef self = args.at(1).refs.at(0);
-  const ValueRef other = args.at(1).refs.at(1);
+  const ValueRef self = input_refs.at(0);
+  const ValueRef other = input_refs.at(1);
 
   const std::vector<int64_t> self_sizes = graph->sizes_of(self);
   const std::vector<int64_t> other_sizes = graph->sizes_of(other);
@@ -61,8 +75,75 @@ void add_binary_op_node(
     const ValueRef alpha,
     const ValueRef out,
     const std::string& op_name) {
-  ValueRef arg1 = prepack_standard_like(graph, in1, out, true);
-  ValueRef arg2 = prepack_standard_like(graph, in2, out, true);
+  auto emit_binary_scalar_node = [&](const ValueRef tensor_in,
+                                     const ValueRef scalar_in,
+                                     const vkapi::ScalarType tensor_dtype,
+                                     float scalar_scale = 1.0f) {
+    ValueRef arg = prepack_standard_like(graph, tensor_in, out, true);
+    float scalar_val = graph.extract_scalar<float>(scalar_in) * scalar_scale;
+
+    std::string kernel_name = op_name + "_scalar";
+    kernel_name.reserve(kShaderNameReserve);
+    add_storage_type_suffix(kernel_name, graph.storage_type_of(out));
+    add_dtype_suffix(kernel_name, tensor_dtype);
+
+    vkapi::ParamsBindList ubos = {graph.meta_ubo(out), graph.meta_ubo(arg)};
+    graph.execute_nodes().emplace_back(new DynamicDispatchNode(
+        graph,
+        VK_KERNEL_FROM_STR(kernel_name),
+        default_pick_global_wg_size,
+        default_pick_local_wg_size,
+        {{out, vkapi::kWrite}, {arg, vkapi::kRead}},
+        ubos,
+        {{PushConstantDataInfo(&scalar_val, sizeof(float))}},
+        {},
+        {},
+        resize_binary_op_node));
+  };
+
+  const bool lhs_is_tensor_like =
+      graph.val_is_tensor(in1) || graph.val_is_tref(in1);
+  const bool rhs_is_tensor_like =
+      graph.val_is_tensor(in2) || graph.val_is_tref(in2);
+  auto materialize_runtime_rank0_buffer_tensor = [&](const ValueRef ref) {
+    if (!graph.val_is_tensor(ref) || !graph.is_buffer_storage(ref) ||
+        !graph.sizes_of(ref).empty()) {
+      return ref;
+    }
+
+    const ValueRef cloned = graph.add_tensor_like(
+        ref, graph.storage_type_of(ref), graph.estimate_memory_layout_of(ref));
+    add_view_copy_node(graph, ref, cloned, {}, nullptr);
+    return cloned;
+  };
+
+  if (!rhs_is_tensor_like && lhs_is_tensor_like) {
+    VK_CHECK_COND(
+        op_name == "add" || op_name == "sub" || op_name == "mul" ||
+        op_name == "div" || op_name == "floor_divide");
+    float scalar_scale = 1.0f;
+    if ((op_name == "add" || op_name == "sub") && is_valid(alpha) &&
+        !graph.val_is_string(alpha)) {
+      scalar_scale = graph.extract_scalar<float>(alpha);
+    }
+    emit_binary_scalar_node(in1, in2, graph.dtype_of(in1), scalar_scale);
+    return;
+  }
+
+  if (!lhs_is_tensor_like && rhs_is_tensor_like) {
+    VK_CHECK_COND(op_name == "add" || op_name == "mul");
+    VK_CHECK_COND(
+        !is_valid(alpha) || graph.val_is_string(alpha) ||
+        graph.extract_scalar<float>(alpha) == 1.0f);
+    emit_binary_scalar_node(in2, in1, graph.dtype_of(in2));
+    return;
+  }
+
+  const ValueRef lhs_input = materialize_runtime_rank0_buffer_tensor(in1);
+  const ValueRef rhs_input = materialize_runtime_rank0_buffer_tensor(in2);
+
+  ValueRef arg1 = prepack_standard_like(graph, lhs_input, out, true);
+  ValueRef arg2 = prepack_standard_like(graph, rhs_input, out, true);
 
   check_binary_op_args(graph, arg1, arg2, out);
 
