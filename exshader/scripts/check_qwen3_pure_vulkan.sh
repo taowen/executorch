@@ -22,4 +22,4 @@ TOKENIZER_JSON="$(exshader_find_qwen3_tokenizer)"
 "$REPO_ROOT/.venv/bin/python" exshader/check_pure_vulkan.py \
   --pte "$PTE_PATH" \
   --flatc "$REPO_ROOT/.venv/bin/flatc" \
-  --run-cmd "$REPO_ROOT/.venv/bin/python -m exshader.recipes.llm_decode --model $PTE_PATH --tokenizer ${TOKENIZER_JSON:?} --prompt 'Write a short poem about Vulkan.' --max-new-tokens 16"
+  --run-cmd "$REPO_ROOT/.venv/bin/python -m exshader.models.qwen3_0_6b.run --pte $PTE_PATH --tokenizer ${TOKENIZER_JSON:?} --prompt 'Write a short poem about Vulkan.' --max-new-tokens 16"

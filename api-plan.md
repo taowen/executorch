@@ -17,7 +17,7 @@
 2. 显式数据流：输入/输出、内存复用、拷贝行为可见可控。
 3. 错误可诊断：错误码 + 上下文，避免“黑盒失败”。
 4. 默认高性能：默认 `clone_outputs=False`，鼓励 buffer 复用。
-5. 任务逻辑上移：LLM 等任务语义留在 Python recipe。
+5. 任务逻辑上移：LLM 等任务语义留在 Python 模型入口。
 6. 不污染全局：`extension/pybindings/pybindings.cpp` 保持通用，不承载 exshader 专用语义。
 
 ## 4. 分层与职责
@@ -35,14 +35,14 @@
 1. L0 的长期目标是两层：
    - C++ 窄 shim：`_exshader_runtime`（独立 pybind 模块，面向 exshader）。
    - Python 封装：`exshader/runtime/session.py`（对外稳定 API）。
-2. 当前状态：已落地 Python 封装；独立 C++ shim 尚未落地，仍暂时复用 `portable_lib`。
-3. 迁移约束：在独立 C++ shim 可用前，不再继续扩展全局 `portable_lib` 绑定行为。
+2. 当前状态：Python 封装与独立 C++ shim 已落地，模型执行主路径走 `_exshader_runtime`。
+3. 迁移约束：不再扩展或依赖全局 `portable_lib` 作为执行入口。
 
 ### L1: 任务编排层（可变）
-位置：`exshader/recipes/*`
+位置：`exshader/models/*`
 
 职责：
-1. 用 L0 实现具体任务 loop（当前仅 LLM）。
+1. 每个模型用 L0 实现自己的导出与执行 loop。
 2. 自主迭代 chunk、采样、cache 策略。
 3. 不引入 C++ 任务分叉。
 
@@ -141,7 +141,7 @@ class SessionHandle:
 
 ## 6. 数据与内存模型
 1. `run(inputs, clone_outputs=False)` 为默认路径。
-2. recipe 热路径必须优先使用复用对象（预分配/in-place）：
+2. 模型执行热路径必须优先使用复用对象（预分配/in-place）：
    - 重复使用输入容器与标量/tensor buffer。
    - 禁止每 token 新建大对象。
 3. 输出复用策略：
@@ -167,11 +167,11 @@ class SessionHandle:
 3. Session 选项：
    - `pure_vulkan_required=True` 时，检测到非 Vulkan 路径直接失败。
 
-## 9. recipe 设计规范（当前只做 LLM）
-1. `exshader/recipes/llm_decode.py` 仅依赖 L0。
-2. 采样策略属于 recipe：
+## 9. model 目录设计规范（当前只做 LLM）
+1. `exshader/models/<model>/run.py` 仅依赖 L0。
+2. 采样策略属于模型自己的 Python 入口：
    - greedy / temperature / top-p 等在 Python 层实现。
-3. kv-cache 管理策略属于 recipe：
+3. kv-cache 管理策略属于模型自己的 Python 入口：
    - 多轮对话、截断、位置推进等不进 C++ 任务 API。
 
 ## 10. 去 torch 运行时依赖计划
@@ -189,26 +189,21 @@ class SessionHandle:
    - exshader 主脚本可运行（在当前模型前提下）。
 3. 具体实现路径：
    - 先落地 `_exshader_runtime` 的无 torch 输入执行路径；
-   - `exshader/recipes/llm_decode.py` 改为仅用 Python list/int 与该 shim 交互；
+   - 模型执行入口改为仅用 Python list/int 与该 shim 交互；
    - 再评估是否保留 torch 作为可选加速依赖（非必须）。
 
 ## 11. 迁移步骤（执行顺序）
 1. 固化 L0 API（`Session/MethodHandle`）并冻结签名。
-2. 将 `llm_decode` 完全收敛到 L0，移除对 L2 的依赖。
-3. 将脚本入口全部切换到 recipe（已完成，继续清理细节）。
+2. 将每个模型的独立执行入口完全收敛到 L0，移除对 L2 的依赖。
+3. 将脚本入口全部切换到 `exshader/models/*`（已完成，继续清理细节）。
 4. 收敛错误信息与观测输出，建立回归基线（性能 + 纯 Vulkan）。
-5. 新增 `_exshader_runtime`（独立 C++ shim），由 `exshader/runtime/session.py` 优先调用。
-6. 在同一模型上做 A/B：
-   - A: `portable_lib` 路径
-   - B: `_exshader_runtime` 路径
-   比较功能一致性、decode 速度、纯 Vulkan 指标。
-7. A/B 通过后，`exshader` 默认切换到 `_exshader_runtime`，`portable_lib` 仅保留兜底调试用途。
+5. 继续以 `_exshader_runtime` 为唯一执行主路径迭代稳定性与性能。
 
 ## 12. 验收标准
 1. 功能：
-   - Qwen3 在 recipe 主路径可运行。
+   - Qwen3 在模型独立主路径可运行。
 2. 架构：
-   - recipe 不依赖任务专用 C++ API。
+   - 模型 Python 入口不依赖任务专用 C++ API。
 3. 性能：
    - decode 热路径无明显重复对象构建。
 4. 纯 Vulkan：
@@ -217,10 +212,10 @@ class SessionHandle:
    - serving 主路径不强制依赖完整 torch。
 
 ## 13. 风险与应对
-1. 某些模型在 L2 接口可跑、L0 recipe 暂时不稳：
+1. 某些模型在 L2 接口可跑、L0 模型入口暂时不稳：
    - 以 L0 为主线排障，不反向扩展 L2。
 2. 不同模型 method 签名差异大：
-   - 在 recipe 层做模型 profile/adapter，不侵入 C++ 主干。
+   - 在模型入口层做 profile/adapter，不侵入 C++ 主干。
 3. 错误码可读性差：
    - 增加错误码映射表与上下文打印。
 

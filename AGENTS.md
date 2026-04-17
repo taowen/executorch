@@ -13,6 +13,7 @@
 3. 不计成本不计代价：优先架构一致性和后续演进效率。
 4. `tools/` 冻结：新增能力放 `exshader/` 或已有主链目录。
 5. 不为具体任务扩散专用 C++ runner。
+6. 禁止 `portable_lib` 路径：模型执行主路径必须走 `exshader` 自己的 runtime shim，不允许新增或依赖 `executorch.extension.pybindings.portable_lib` / `_load_for_executorch` 作为运行入口。
 
 ## Environment Bootstrap
 环境必须满足“两件事同时成立”：
@@ -23,13 +24,14 @@
 1. `cd /home/taowen/projects/exshader`
 2. `uv venv --seed --clear .venv`
 3. `./.venv/bin/python install_requirements.py --example`
-4. `CMAKE_ARGS='-DEXECUTORCH_BUILD_VULKAN=ON -DEXECUTORCH_BUILD_XNNPACK=OFF -DEXECUTORCH_BUILD_COREML=OFF -DEXECUTORCH_BUILD_OPENVINO=OFF -DEXECUTORCH_BUILD_QNN=OFF -DEXECUTORCH_BUILD_TESTS=OFF -DEXECUTORCH_BUILD_EXTENSION_LLM=ON -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON -DEXECUTORCH_BUILD_EXTENSION_NAMED_DATA_MAP=ON -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON -DEXECUTORCH_BUILD_EXSHADER_RUNTIME=ON -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON -DEXECUTORCH_BUILD_KERNELS_LLM=ON -DEXECUTORCH_BUILD_KERNELS_LLM_AOT=ON' ./.venv/bin/python -m pip install --no-build-isolation -e .`
+4. `CMAKE_ARGS='-DEXECUTORCH_BUILD_PYBIND=ON -DEXECUTORCH_BUILD_VULKAN=ON -DEXECUTORCH_BUILD_XNNPACK=OFF -DEXECUTORCH_BUILD_COREML=OFF -DEXECUTORCH_BUILD_OPENVINO=OFF -DEXECUTORCH_BUILD_QNN=OFF -DEXECUTORCH_BUILD_TESTS=OFF -DEXECUTORCH_BUILD_EXTENSION_LLM=ON -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON -DEXECUTORCH_BUILD_EXTENSION_NAMED_DATA_MAP=ON -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON -DEXECUTORCH_BUILD_EXSHADER_RUNTIME=ON -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON -DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON -DEXECUTORCH_BUILD_KERNELS_LLM=ON -DEXECUTORCH_BUILD_KERNELS_LLM_AOT=ON' ./.venv/bin/python -m pip install --no-build-isolation -e .`
 5. `exshader/scripts/build_vulkan.sh --clean`
 6. `source exshader/env.sh`
 
 必要说明：
 1. 这棵树是 Vulkan-only，editable install 不能走默认 `pybind` preset 配置；默认会把 `EXECUTORCH_BUILD_XNNPACK` 打开，直接触发根目录 `CMakeLists.txt` 的 pruned-tree 校验失败。
-2. 仅仅传 `-DEXECUTORCH_BUILD_VULKAN=ON -DEXECUTORCH_BUILD_XNNPACK=OFF` 还不够。Qwen 主链实际依赖 `build_vulkan.sh` 那套完整开关，尤其是：
+2. `exshader` runtime shim 依赖 `EXECUTORCH_BUILD_PYBIND=ON`。只开 `EXECUTORCH_BUILD_EXSHADER_RUNTIME=ON` 不够；如果 `EXECUTORCH_BUILD_PYBIND=OFF`，顶层 CMake 不会把 `extension/exshader/runtime` 加进构建图。
+3. 仅仅传 `-DEXECUTORCH_BUILD_VULKAN=ON -DEXECUTORCH_BUILD_XNNPACK=OFF` 还不够。Qwen 主链实际依赖 `build_vulkan.sh` 那套完整开关，尤其是：
    - `EXECUTORCH_BUILD_EXSHADER_RUNTIME=ON`
    - `EXECUTORCH_BUILD_EXTENSION_LLM=ON`
    - `EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON`
@@ -38,12 +40,12 @@
    - `EXECUTORCH_BUILD_KERNELS_OPTIMIZED=ON`
    - `EXECUTORCH_BUILD_KERNELS_LLM=ON`
    - `EXECUTORCH_BUILD_KERNELS_LLM_AOT=ON`
-3. 如果 `extension/llm/tokenizers` 安装时抱怨 CMake cache 指向别的仓库，先删：
+4. 如果 `extension/llm/tokenizers` 安装时抱怨 CMake cache 指向别的仓库，先删：
    - `extension/llm/tokenizers/build`
    - `third-party/ao/build`
    然后重跑安装。
-4. `.venv` 重建以后，优先跟一次 `exshader/scripts/build_vulkan.sh --clean`，避免 Python 绑定和旧的 Vulkan 产物错配。
-5. 环境修好以后，不应该再依赖 `PYTHONPATH="$PWD/src:$PWD"` 这种临时覆盖；它只适合拿来快速确认“当前 `.venv` 是否串仓库了”。
+5. `.venv` 重建以后，优先跟一次 `exshader/scripts/build_vulkan.sh --clean`，避免 Python 绑定和旧的 Vulkan 产物错配。
+6. 环境修好以后，不应该再依赖 `PYTHONPATH="$PWD/src:$PWD"` 这种临时覆盖；它只适合拿来快速确认“当前 `.venv` 是否串仓库了”。
 
 每次重建后先做自检：
 1. `./.venv/bin/python - <<'PY'`
@@ -118,8 +120,8 @@ export/lowering 合同错误：
    - Python 导出主入口
 3. `exshader/runtime/`
    - Python-first runtime 封装
-4. `exshader/recipes/`
-   - 多次 forward / 调度 / 采样等 Python 任务层
+4. `exshader/models/`
+   - 每个模型各自独立的导出与执行代码
 5. `exshader/diag/`
    - 面向 agent 的调试与诊断工具
 6. `exshader/scripts/`

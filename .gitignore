@@ -4,8 +4,15 @@
 # Python environment and cache
 .hypothesis
 .mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+.pyre/
 .venv/
 __pycache__/
+*.py[cod]
+htmlcov/
 
 # Build and tool-generated files
 arm_test/

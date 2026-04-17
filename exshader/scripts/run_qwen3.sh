@@ -22,8 +22,8 @@ fi
 
 TOKENIZER_JSON="$(exshader_find_qwen3_tokenizer)"
 
-"$REPO_ROOT/.venv/bin/python" -m exshader.recipes.llm_decode \
-  --model "$PTE_PATH" \
+"$REPO_ROOT/.venv/bin/python" -m exshader.models.qwen3_0_6b.run \
+  --pte "$PTE_PATH" \
   --tokenizer "${TOKENIZER_JSON:?}" \
   --prompt "$PROMPT" \
   --max-new-tokens "${MAX_NEW_TOKENS:-64}" \

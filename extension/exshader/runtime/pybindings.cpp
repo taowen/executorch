@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <executorch/extension/module/module.h>
+#include <executorch/extension/aten_util/aten_bridge.h>
 #include <executorch/extension/tensor/tensor_ptr.h>
 #include <executorch/backends/vulkan/runtime/VulkanExecuteTelemetry.h>
 #include <executorch/runtime/backend/interface.h>
@@ -33,6 +34,10 @@
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <executorch/runtime/core/tag.h>
 #include <executorch/runtime/executor/program.h>
+
+#include <ATen/Tensor.h>
+#include <torch/csrc/utils/pybind.h>
+#include <torch/python.h>
 
 #define THROW_IF_ERROR(error, message, ...)                       \
   ({                                                              \
@@ -52,8 +57,10 @@ using ::executorch::ET_RUNTIME_NAMESPACE::get_num_registered_backends;
 using ::executorch::backends::vulkan::VulkanExecuteTelemetry;
 using ::executorch::backends::vulkan::get_last_vulkan_execute_telemetry;
 using ::executorch::backends::vulkan::reset_last_vulkan_execute_telemetry;
+using ::executorch::extension::alias_etensor_to_attensor;
 using ::executorch::extension::Module;
 using ::executorch::extension::TensorPtr;
+using ::executorch::extension::torch_to_executorch_scalar_type;
 using ::executorch::runtime::EValue;
 using ::executorch::runtime::Program;
 using ::executorch::runtime::Tag;
@@ -187,6 +194,37 @@ inline TensorPtr make_int64_tensor_ptr(
       {},
       executorch::aten::ScalarType::Long,
       executorch::aten::TensorShapeDynamism::STATIC);
+}
+
+void populate_etensor_metadata_from_aten(
+    const at::Tensor& at_tensor,
+    std::vector<torch::executor::Tensor::SizesType>& sizes,
+    std::vector<torch::executor::Tensor::StridesType>& strides,
+    std::vector<torch::executor::Tensor::DimOrderType>& dim_order,
+    const std::string& input_name) {
+  const size_t dim = at_tensor.dim();
+  sizes.assign(at_tensor.sizes().begin(), at_tensor.sizes().end());
+  strides.assign(at_tensor.strides().begin(), at_tensor.strides().end());
+
+  dim_order.clear();
+  if (at_tensor.is_contiguous()) {
+    for (size_t cur_dim = 0; cur_dim < dim; cur_dim++) {
+      dim_order.push_back(cur_dim);
+    }
+  } else if (
+      at_tensor.is_contiguous(at::MemoryFormat::ChannelsLast) &&
+      at_tensor.dim() == 4) {
+    dim_order = {0, 2, 3, 1};
+  } else {
+    throw std::runtime_error(
+        input_name + " should be contiguous or channels-last.");
+  }
+
+  if (dim == 0) {
+    sizes.push_back(1);
+    strides.push_back(1);
+    dim_order.push_back(0);
+  }
 }
 
 template <typename T>
@@ -672,10 +710,12 @@ class SessionHandle final {
       std::optional<std::string> data_map_path,
       Program::Verification program_verification)
       : model_path_(model_path), data_map_path_(std::move(data_map_path)) {
+    constexpr auto kLoadMode = Module::LoadMode::MmapUseMlockIgnoreErrors;
     if (data_map_path_.has_value()) {
-      module_ = std::make_shared<Module>(model_path_, data_map_path_.value());
+      module_ = std::make_shared<Module>(
+          model_path_, data_map_path_.value(), kLoadMode);
     } else {
-      module_ = std::make_shared<Module>(model_path_);
+      module_ = std::make_shared<Module>(model_path_, kLoadMode);
     }
     THROW_IF_ERROR(
         module_->load(program_verification),
@@ -876,6 +916,12 @@ class SessionHandle final {
   struct MethodContext {
     std::vector<EValue> inputs;
     std::vector<TensorPtr> tensor_owners;
+    std::vector<torch::executor::TensorImpl> input_tensors;
+    std::vector<std::vector<torch::executor::Tensor::SizesType>> input_sizes;
+    std::vector<std::vector<torch::executor::Tensor::StridesType>>
+        input_strides;
+    std::vector<std::vector<torch::executor::Tensor::DimOrderType>>
+        input_dim_order;
     std::shared_ptr<std::vector<EValue>> outputs_owner;
     MethodRunStats last_stats;
   };
@@ -887,12 +933,43 @@ class SessionHandle final {
     const auto inputs_size = py::len(inputs);
     context.inputs.clear();
     context.tensor_owners.clear();
+    context.input_tensors.clear();
+    context.input_sizes.clear();
+    context.input_strides.clear();
+    context.input_dim_order.clear();
     context.inputs.reserve(inputs_size);
     context.tensor_owners.reserve(inputs_size);
+    context.input_tensors.reserve(inputs_size);
 
     for (size_t i = 0; i < inputs_size; ++i) {
       py::handle input = inputs[i];
-      if (py::isinstance<PyExTensor>(input)) {
+      const std::string type_str = py::str(input.get_type());
+      if (type_str == "<class 'torch.Tensor'>") {
+        auto at_tensor = input.cast<at::Tensor>();
+        auto type = torch_to_executorch_scalar_type(at_tensor.options().dtype());
+        size_t dim = at_tensor.dim();
+        context.input_sizes.emplace_back();
+        context.input_strides.emplace_back();
+        context.input_dim_order.emplace_back();
+        populate_etensor_metadata_from_aten(
+            at_tensor,
+            context.input_sizes.back(),
+            context.input_strides.back(),
+            context.input_dim_order.back(),
+            "Input " + std::to_string(i) + " for method " + method_name);
+        context.input_tensors.emplace_back(
+            type,
+            dim,
+            context.input_sizes.back().data(),
+            nullptr,
+            context.input_dim_order.back().data(),
+            context.input_strides.back().data());
+
+        torch::executor::Tensor temp =
+            torch::executor::Tensor(&context.input_tensors.back());
+        alias_etensor_to_attensor(at_tensor, temp);
+        context.inputs.push_back(EValue(temp));
+      } else if (py::isinstance<PyExTensor>(input)) {
         const auto& ex_tensor = input.cast<const PyExTensor&>();
         context.tensor_owners.push_back(ex_tensor.tensor_ptr());
         context.inputs.push_back(EValue(context.tensor_owners.back()));

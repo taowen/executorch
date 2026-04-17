@@ -14,15 +14,37 @@ if(NOT EXECUTORCH_BUILD_PYBIND)
   return()
 endif()
 
+find_package_torch()
+find_library(
+  TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib"
+)
+
 pybind11_add_module(_exshader_runtime SHARED pybindings.cpp)
 
 target_include_directories(
-  _exshader_runtime PRIVATE ${_common_include_directories}
+  _exshader_runtime PRIVATE ${_common_include_directories} ${TORCH_INCLUDE_DIRS}
+)
+
+target_compile_options(
+  _exshader_runtime
+  PUBLIC $<$<CXX_COMPILER_ID:MSVC>:/EHsc
+         /GR
+         /wd4996>
+         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-deprecated-declarations
+         -fPIC
+         -frtti
+         -fexceptions>
 )
 
 target_link_libraries(
   _exshader_runtime
-  PRIVATE executorch extension_module_static extension_tensor extension_data_loader
+  PRIVATE executorch
+          extension_module_static
+          extension_tensor
+          extension_data_loader
+          util
+          ${TORCH_PYTHON_LIBRARY}
+          ${TORCH_LIBRARIES}
 )
 
 if(TARGET optimized_native_cpu_ops_lib)
@@ -45,9 +67,9 @@ set_target_properties(
 )
 
 if(APPLE)
-  set(RPATH "@loader_path")
+  set(RPATH "@loader_path;@loader_path/../../.venv/lib/python3.12/site-packages/torch/lib")
 else()
-  set(RPATH "$ORIGIN")
+  set(RPATH "$ORIGIN:$ORIGIN/../../.venv/lib/python3.12/site-packages/torch/lib")
 endif()
 set_target_properties(
   _exshader_runtime PROPERTIES BUILD_RPATH "${RPATH}" INSTALL_RPATH "${RPATH}"
