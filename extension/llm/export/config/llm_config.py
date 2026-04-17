@@ -38,6 +38,7 @@ class ModelType(str, Enum):
     llama3_2 = "llama3_2"
     llama3_2_vision = "llama3_2_vision"
     static_llama = "static_llama"
+    gemma3_1b = "gemma3_1b"
     qwen2_5_0_5b = "qwen2_5_0_5b"
     qwen2_5_1_5b = "qwen2_5_1_5b"
     qwen2_5_coder_32b = "qwen2_5_coder_32b"

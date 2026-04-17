@@ -76,6 +76,7 @@ EXECUTORCH_DEFINED_MODELS = [
     "llama3_1",
     "llama3_2",
     "static_llama",
+    "gemma3_1b",
     "qwen2_5_0_5b",
     "qwen2_5_1_5b",
     "qwen2_5_coder_32b",
@@ -94,6 +95,7 @@ EXECUTORCH_DEFINED_MODELS = [
 ]
 TORCHTUNE_DEFINED_MODELS = ["llama3_2_vision"]
 HUGGING_FACE_REPO_IDS = {
+    "gemma3_1b": "google/gemma-3-1b-it",
     "qwen2_5_0_5b": "Qwen/Qwen2.5-0.5B",
     "qwen2_5_1_5b": "Qwen/Qwen2.5-1.5B",
     "qwen2_5_coder_32b": "Qwen/Qwen2.5-Coder-32B-Instruct",
@@ -526,6 +528,8 @@ def export_llama(  # noqa: C901
         repo_id = HUGGING_FACE_REPO_IDS[model_name]
         if model_name.startswith("qwen2_5"):
             from executorch.examples.models.qwen2_5 import convert_weights
+        elif model_name == "gemma3_1b":
+            from executorch.examples.models.gemma3 import convert_weights
         elif model_name.startswith("qwen3_5"):
             from executorch.examples.models.qwen3_5 import convert_weights
         elif model_name.startswith("qwen3"):

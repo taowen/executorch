@@ -9,6 +9,7 @@
   "act_fn": "gelu_approx",
   "norm_type": "gemma3",
   "norm_eps": 1e-06,
+  "rms_norm_add_unit_offset": true,
   "post_attention_norm": true,
   "post_ffn_norm": true,
   "rope_theta": 1000000.0,

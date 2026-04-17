@@ -136,10 +136,28 @@ class TransformerBlock(nn.Module):
                 eps=args.norm_eps,
                 add_unit_offset=args.rms_norm_add_unit_offset,
             )
+        self.post_attention_norm = (
+            RMSNorm(
+                args.dim,
+                eps=args.norm_eps,
+                add_unit_offset=args.rms_norm_add_unit_offset,
+            )
+            if args.post_attention_norm
+            else nn.Identity()
+        )
         self.ffn_norm = RMSNorm(
             args.dim,
             eps=args.norm_eps,
             add_unit_offset=args.rms_norm_add_unit_offset,
+        )
+        self.post_ffn_norm = (
+            RMSNorm(
+                args.dim,
+                eps=args.norm_eps,
+                add_unit_offset=args.rms_norm_add_unit_offset,
+            )
+            if args.post_ffn_norm
+            else nn.Identity()
         )
 
     @classmethod
@@ -165,12 +183,13 @@ class TransformerBlock(nn.Module):
             self.attention_norm(x), freqs_cos, freqs_sin, **attn_options
         )
         if not isinstance(self.attention, AttentionSkip):
-            h = x + h
+            h = x + self.post_attention_norm(h)
 
         if hasattr(self, "block_sparse_moe"):
-            out = h + self.block_sparse_moe(self.ffn_norm(h))
+            out = self.block_sparse_moe(self.ffn_norm(h))
         else:
-            out = h + self.feed_forward(self.ffn_norm(h))
+            out = self.feed_forward(self.ffn_norm(h))
+        out = h + self.post_ffn_norm(out)
         return out, attn_options_update
 
 
@@ -276,6 +295,8 @@ class Transformer(nn.Module):
             )
         if self.apply_embedding and tokens is not None and h is None:
             h = self.tok_embeddings(tokens)
+            if self.params.embedding_scale_factor != 1.0:
+                h = h * self.params.embedding_scale_factor
 
         if attn_options is None:
             attn_options = {}
@@ -298,6 +319,10 @@ class Transformer(nn.Module):
 
         if self.apply_output:
             logits = self.output(h)
+            if self.params.final_logit_softcapping is not None:
+                logits = logits / self.params.final_logit_softcapping
+                logits = torch.tanh(logits)
+                logits = logits * self.params.final_logit_softcapping
 
             if self.output_prune_map is not None:
                 if self.generate_full_logits:
