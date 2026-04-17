@@ -76,14 +76,12 @@ xcuserdata/
 *.pyd
 
 
-# Agents
+# Agent / local workflow artifacts
 .claude/*.local.*
 extension/pybindings/mlx.metallib
 outputs/
-uv.lock
-
-# Local pure-vulkan artifacts
 artifacts/
+uv.lock
 vk_bundle*/
 *.spv
 bundle.tsv

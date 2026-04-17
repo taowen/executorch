@@ -1,0 +1,43 @@
+load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
+load("@fbsource//xplat/executorch/build:runtime_wrapper.bzl", "runtime")
+
+oncall("executorch")
+
+runtime.python_library(
+    name = "core",
+    srcs = [
+        "__init__.py",
+        "core.py",
+        "delegate_abi.py",
+    ],
+    deps = [
+        "//caffe2:torch",
+        "//executorch/backends/vulkan/serialization:lib",
+        "//executorch/devtools:lib",
+        "//executorch/devtools/inspector:inspector",
+        "//executorch/devtools/inspector:inspector_utils",
+        "//executorch/devtools/inspector:intermediate_output_capturer",
+        "//executorch/exir:lib",
+        "//executorch/exir:lowered_backend_module",
+        "//executorch/runtime:runtime",
+    ],
+)
+
+python_binary(
+    name = "cli",
+    main_function = ".cli.main",
+    main_src = "cli.py",
+    deps = [
+        ":core",
+        "//executorch/runtime:runtime",
+    ],
+)
+
+python_binary(
+    name = "delegate_abi_cli",
+    main_function = ".delegate_abi_cli.main",
+    main_src = "delegate_abi_cli.py",
+    deps = [
+        ":core",
+    ],
+)

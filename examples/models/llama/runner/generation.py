@@ -74,6 +74,7 @@ class LlamaRunner(ABC):
         self.use_kv_cache = use_kv_cache
         self.tokenizer = get_tokenizer(tokenizer_path, tokenizer_config_path)
         self.device = device
+        self.prefill_chunk_size: Optional[int] = None
         # For some models like qwen, mismatch is acceptable: https://github.com/QwenLM/Qwen2.5/issues/466#issuecomment-2146759706
         if vocab_size != self.tokenizer.n_words:
             print(
@@ -99,14 +100,35 @@ class LlamaRunner(ABC):
     ) -> List[int]:
         # Prefill
         prefill_start = time.time()
-        logits = self.forward(
-            tokens=torch.tensor([prompt_tokens], dtype=torch.long, device=self.device),
-            input_pos=(
-                torch.tensor([pos_base], dtype=torch.long, device=self.device)
-                if self.use_kv_cache
-                else None
-            ),
-        )
+        if self.use_kv_cache and self.prefill_chunk_size == 1:
+            if len(prompt_tokens) == 0:
+                raise ValueError(
+                    "Received an empty prompt for a static-shape KV-cache model "
+                    "that expects token shape [1, 1]."
+                )
+            logits = None
+            for i, token in enumerate(prompt_tokens):
+                logits = self.forward(
+                    tokens=torch.tensor([[token]], dtype=torch.long, device=self.device),
+                    input_pos=torch.tensor(
+                        [pos_base + i],
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                )
+            if logits is None:
+                raise RuntimeError("Prefill produced no logits.")
+        else:
+            logits = self.forward(
+                tokens=torch.tensor(
+                    [prompt_tokens], dtype=torch.long, device=self.device
+                ),
+                input_pos=(
+                    torch.tensor([pos_base], dtype=torch.long, device=self.device)
+                    if self.use_kv_cache
+                    else None
+                ),
+            )
         prefill_time = time.time() - prefill_start
 
         current_token = next_token(logits, temperature, top_p)
@@ -172,8 +194,17 @@ class LlamaRunner(ABC):
         Note:
             This method generates text completion for the provided prompt, employing nucleus sampling to introduce controlled randomness.
         """
+        prompt_tokens = self.tokenizer.encode(prompt, bos=True, eos=False)
+        remaining_budget = self.max_seq_len - len(prompt_tokens)
+        if remaining_budget <= 1:
+            print(
+                "Warning - max_seq_len is treated as total sequence length "
+                f"(prompt + generated). Prompt tokens: {len(prompt_tokens)}, "
+                f"max_seq_len: {self.max_seq_len}, remaining generation budget: "
+                f"{remaining_budget}."
+            )
         return self.generate(
-            prompt_tokens=self.tokenizer.encode(prompt, bos=True, eos=False),
+            prompt_tokens=prompt_tokens,
             max_seq_len=self.max_seq_len,
             temperature=temperature,
             top_p=top_p,

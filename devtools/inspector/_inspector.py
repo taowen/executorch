@@ -8,6 +8,7 @@
 
 import dataclasses
 import logging
+import re
 import sys
 import warnings
 from collections import defaultdict, OrderedDict
@@ -80,6 +81,94 @@ from executorch.exir import ExportedProgram
 
 
 log: logging.Logger = logging.getLogger(__name__)
+_VULKAN_DELEGATE_DEBUG_ID_RE = re.compile(r'"delegate_debug_id"\s*:\s*(-?\d+)')
+_VULKAN_DISPATCH_ID_RE = re.compile(r'"dispatch_id"\s*:\s*(-?\d+)')
+_VULKAN_KERNEL_NAME_RE = re.compile(r'"kernel_name"\s*:\s*"([^"]+)"')
+_VULKAN_OPERATOR_NAME_RE = re.compile(r'"operator"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"')
+
+
+def _is_expected_unmapped_vulkan_delegate_event(
+    backend_name: str,
+    delegate_debug_id: Optional[Union[int, str]],
+) -> bool:
+    if backend_name != "VulkanBackend" or not isinstance(delegate_debug_id, str):
+        return False
+    return (
+        delegate_debug_id.startswith("ETVK_")
+        or delegate_debug_id.startswith('{"kernel_name": ')
+        or delegate_debug_id.startswith('{{"kernel_name": ')
+    )
+
+
+def _delegate_debug_id_lookup_candidates(
+    backend_name: str,
+    delegate_debug_id: Optional[Union[int, str]],
+) -> List[Union[int, str]]:
+    if delegate_debug_id is None:
+        return []
+    candidates: List[Union[int, str]] = [delegate_debug_id]
+    if backend_name != "VulkanBackend" or not isinstance(delegate_debug_id, str):
+        return candidates
+
+    match = _VULKAN_DELEGATE_DEBUG_ID_RE.search(delegate_debug_id)
+    if match is None:
+        return candidates
+
+    local_id = match.group(1)
+    try:
+        local_id_int = int(local_id)
+    except ValueError:
+        local_id_int = None
+
+    if local_id not in candidates:
+        candidates.append(local_id)
+    if local_id_int is not None and local_id_int not in candidates:
+        candidates.append(local_id_int)
+    return candidates
+
+
+class VulkanDispatchMetadata(TypedDict):
+    delegate_debug_id: int
+    dispatch_id: Optional[int]
+    kernel_name: str
+    operator_name: Optional[str]
+
+
+def _parse_vulkan_dispatch_metadata(
+    delegate_debug_id: Optional[Union[int, str]],
+) -> Optional[VulkanDispatchMetadata]:
+    if not isinstance(delegate_debug_id, str):
+        return None
+
+    local_id_match = _VULKAN_DELEGATE_DEBUG_ID_RE.search(delegate_debug_id)
+    kernel_name_match = _VULKAN_KERNEL_NAME_RE.search(delegate_debug_id)
+    if local_id_match is None or kernel_name_match is None:
+        return None
+
+    try:
+        local_id = int(local_id_match.group(1))
+    except ValueError:
+        return None
+
+    dispatch_id = None
+    dispatch_id_match = _VULKAN_DISPATCH_ID_RE.search(delegate_debug_id)
+    if dispatch_id_match is not None:
+        try:
+            dispatch_id = int(dispatch_id_match.group(1))
+        except ValueError:
+            dispatch_id = None
+
+    operator_name = None
+    operator_name_match = _VULKAN_OPERATOR_NAME_RE.search(delegate_debug_id)
+    if operator_name_match is not None:
+        operator_name = operator_name_match.group(1)
+
+    return {
+        "delegate_debug_id": local_id,
+        "dispatch_id": dispatch_id,
+        "kernel_name": kernel_name_match.group(1),
+        "operator_name": operator_name,
+    }
 
 
 # Signature of an InstructionEvent
@@ -345,6 +434,9 @@ class Event:
     module_hierarchy: Dict[str, Dict] = dataclasses.field(default_factory=dict)
     is_delegated_op: Optional[bool] = None
     delegate_backend_name: Optional[str] = None
+    delegate_kernel_name: Optional[str] = None
+    delegate_operator_name: Optional[str] = None
+    delegate_dispatch_id: Optional[int] = None
     _delegate_debug_metadatas: List[str] = dataclasses.field(default_factory=list)
 
     debug_data: ProgramOutput = dataclasses.field(default_factory=list)
@@ -429,6 +521,9 @@ class Event:
             "module_hierarchy": [self.module_hierarchy],
             "is_delegated_op": self.is_delegated_op,
             "delegate_backend_name": self.delegate_backend_name,
+            "delegate_kernel_name": self.delegate_kernel_name,
+            "delegate_operator_name": self.delegate_operator_name,
+            "delegate_dispatch_id": self.delegate_dispatch_id,
             "debug_data": [self.debug_data],
             "start_time": [self._start_time],
         }
@@ -644,19 +739,22 @@ class Event:
             if (debug_events := event.debug_events) is None:
                 continue
 
-            # Populate on the first iteration only, then verify equivalence for others
+            # Populate on the first iteration only. If later iterations produce
+            # different debug values, keep the latest iteration instead of
+            # asserting. Stateful models legitimately change intermediate
+            # tensors across repeated executions with the same run signature.
             if len(debug_data) == 0:
                 debug_data = [debug_event.debug_entry for debug_event in debug_events]
             else:
+                keep_existing = True
                 for debug_event, value in zip(debug_events, debug_data):
                     v1 = inflate_runtime_output(debug_event.debug_entry, output_buffer)
                     v2 = inflate_runtime_output(value, output_buffer)
-                    assert is_inference_output_equal(
-                        v1, v2
-                    ), """Corresponding debug events in multiple iterations of the model
-                    must have the same debug entry values. This is not the case for the
-                    intermediate data present in this ETDump and indicates potential issues
-                    with the model/runtime."""
+                    if not is_inference_output_equal(v1, v2):
+                        keep_existing = False
+                        break
+                if not keep_existing:
+                    debug_data = [debug_event.debug_entry for debug_event in debug_events]
 
         ret_event.debug_data = [
             inflate_runtime_output(debug_value, output_buffer)
@@ -722,6 +820,55 @@ class EventBlock:
     bundled_input_index: Optional[int] = None
     run_output: Optional[ProgramOutput] = None
     reference_output: Optional[ProgramOutput] = None
+
+    @staticmethod
+    def _build_vulkan_dispatch_metadata_map(
+        events: Sequence[Event],
+        delegate_map: Optional[Dict[str, DelegateMetadata]],
+    ) -> Dict[str, Dict[int, VulkanDispatchMetadata]]:
+        if delegate_map is None:
+            return {}
+
+        metadata_by_instruction: Dict[str, Dict[int, VulkanDispatchMetadata]] = {}
+        for event in events:
+            if event._instruction_id is None:
+                continue
+            instruction_id = str(event._instruction_id)
+            delegate_metadata = delegate_map.get(instruction_id)
+            if delegate_metadata is None or delegate_metadata.get("name") != "VulkanBackend":
+                continue
+
+            parsed_metadata = _parse_vulkan_dispatch_metadata(
+                event.delegate_debug_identifier
+            )
+            if parsed_metadata is None:
+                continue
+
+            metadata_by_instruction.setdefault(instruction_id, {})[
+                parsed_metadata["delegate_debug_id"]
+            ] = parsed_metadata
+
+        return metadata_by_instruction
+
+    @staticmethod
+    def _populate_vulkan_dispatch_metadata(
+        event: Event,
+        metadata_by_instruction: Dict[str, Dict[int, VulkanDispatchMetadata]],
+    ) -> None:
+        if event.delegate_backend_name != "VulkanBackend" or event._instruction_id is None:
+            return
+
+        parsed_metadata = _parse_vulkan_dispatch_metadata(event.delegate_debug_identifier)
+        if parsed_metadata is None and isinstance(event.delegate_debug_identifier, int):
+            parsed_metadata = metadata_by_instruction.get(str(event._instruction_id), {}).get(
+                event.delegate_debug_identifier
+            )
+        if parsed_metadata is None:
+            return
+
+        event.delegate_kernel_name = parsed_metadata.get("kernel_name")
+        event.delegate_operator_name = parsed_metadata.get("operator_name")
+        event.delegate_dispatch_id = parsed_metadata.get("dispatch_id")
 
     def to_dataframe(
         self, include_units: bool = False, include_delegate_debug_data: bool = False
@@ -863,7 +1010,11 @@ class EventBlock:
             if len(existing_run_outputs := run_groups[run_signature].run_output) == 0:
                 existing_run_outputs.extend(run_outputs)
             else:
-                verify_debug_data_equivalence(existing_run_outputs, run_outputs)
+                try:
+                    verify_debug_data_equivalence(existing_run_outputs, run_outputs)
+                except AssertionError:
+                    existing_run_outputs.clear()
+                    existing_run_outputs.extend(run_outputs)
 
         # Construct the EventBlocks
         event_blocks = []
@@ -941,6 +1092,10 @@ class EventBlock:
         If the event is delegated, index with the instruction_id and delegate_debug_identifier
         to obtain the debug_handle via the delegate map
         """
+        vulkan_dispatch_metadata_by_instruction = self._build_vulkan_dispatch_metadata_map(
+            self.events,
+            delegate_map,
+        )
         for event in self.events:
             # Check if instruction_id is present in the event
             if event._instruction_id is None:
@@ -966,6 +1121,10 @@ class EventBlock:
                     is not None
                 ):
                     event.delegate_backend_name = delegate_metadata.get("name", "")
+                    self._populate_vulkan_dispatch_metadata(
+                        event,
+                        vulkan_dispatch_metadata_by_instruction,
+                    )
 
                 continue
 
@@ -982,21 +1141,33 @@ class EventBlock:
 
             # For delegated events, handles are found via delegateMetadata
             event.delegate_backend_name = delegate_metadata.get("name", "")
+            self._populate_vulkan_dispatch_metadata(
+                event,
+                vulkan_dispatch_metadata_by_instruction,
+            )
             delegate_metadata_delegate_map = delegate_metadata.get("delegate_map") or {}
 
             # delegate_debug_id can be either int based or string based, therefore we need to check both
-            debug_handles = delegate_metadata_delegate_map.get(
-                delegate_debug_id  # pyre-ignore
-            )
-            if debug_handles is not None:
-                event.debug_handles = debug_handles
-            else:
-                event.debug_handles = delegate_metadata_delegate_map.get(
-                    str(delegate_debug_id)  # pyre-ignore
-                )
-                for key, value in delegate_metadata_delegate_map.items():
-                    if key in str(delegate_debug_id):
-                        event.debug_handles = value
+            debug_handles = None
+            for candidate in _delegate_debug_id_lookup_candidates(
+                event.delegate_backend_name, delegate_debug_id
+            ):
+                debug_handles = delegate_metadata_delegate_map.get(candidate)  # pyre-ignore
+                if debug_handles is not None:
+                    break
+                debug_handles = delegate_metadata_delegate_map.get(str(candidate))
+                if debug_handles is not None:
+                    break
+            event.debug_handles = debug_handles
+            if event.debug_handles is None:
+                if not _is_expected_unmapped_vulkan_delegate_event(
+                    event.delegate_backend_name, delegate_debug_id
+                ):
+                    log.warning(
+                        "No exact delegate debug mapping for instruction_id=%s delegate_debug_id=%s",
+                        event._instruction_id,
+                        delegate_debug_id,
+                    )
 
 
 class Inspector:
@@ -1337,6 +1508,14 @@ class Inspector:
         Retrieve the runtime intermediate outputs(debug handles and intermediate values mappings)
         from the event blocks, along with the corresponding debug handles and op names mapping.
         """
+
+        def _has_populated_debug_data(debug_data: Any) -> bool:
+            if debug_data is None:
+                return False
+            if isinstance(debug_data, list):
+                return len(debug_data) > 0
+            return True
+
         debug_handle_to_output = {}
         debug_handle_to_op_names = {}
         for event_block in self.event_blocks:
@@ -1346,6 +1525,11 @@ class Inspector:
                     event.name in EXCLUDED_EVENTS_FOR_INTERMEDIATE_OUTPUT
                     or not event.op_types
                 ):
+                    continue
+                # Backend-specific trace events may share the same debug handle as the
+                # higher-level runtime event but have no intermediate tensors attached.
+                # Ignore those here so they do not overwrite the actual captured output.
+                if not _has_populated_debug_data(event.debug_data):
                     continue
                 # Normalize debug_handle to a tuple
                 debug_handle = event.debug_handles

@@ -148,6 +148,15 @@ class ETDumpGen : public ::executorch::runtime::EventTracer {
       DelegateDebugIntId delegate_debug_index,
       const double& output) override;
 
+  virtual Result<bool> should_materialize_delegate_intermediate_output(
+      const char* name,
+      DelegateDebugIntId delegate_debug_index) override;
+
+  bool has_delegate_intermediate_output_focus() const override;
+
+  virtual void set_intermediate_output_filter(
+      EventTracerFilterBase* event_tracer_filter);
+
   /**
    * Set the filter of event tracer for delegation intermediate outputs.
    */
@@ -197,7 +206,8 @@ class ETDumpGen : public ::executorch::runtime::EventTracer {
   State state_ = State::Init;
   struct internal::ETDumpStaticAllocator alloc_;
 
-  EventTracerFilterBase* filter_ = nullptr;
+  EventTracerFilterBase* intermediate_output_filter_ = nullptr;
+  EventTracerFilterBase* delegate_intermediate_output_filter_ = nullptr;
 };
 
 } // namespace etdump

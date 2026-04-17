@@ -14,6 +14,28 @@
 
 namespace vkcompute {
 
+#ifdef ET_EVENT_TRACER_ENABLED
+namespace {
+
+std::string make_dispatch_metadata_json(
+    const std::string& kernel_name,
+    const uint32_t delegate_debug_id,
+    const std::string& operator_json) {
+  std::string metadata = "{";
+  if (!operator_json.empty()) {
+    metadata += "\"operator\": {" + operator_json + "}, ";
+  }
+  metadata += "\"kernel_name\": \"" + kernel_name + "\"";
+  if (delegate_debug_id != UINT32_MAX) {
+    metadata += ", \"delegate_debug_id\": " + std::to_string(delegate_debug_id);
+  }
+  metadata += "}";
+  return metadata;
+}
+
+} // namespace
+#endif
+
 DispatchNode::DispatchNode(
     ComputeGraph& graph,
     const vkapi::ShaderInfo& shader,
@@ -61,17 +83,13 @@ void DispatchNode::encode(ComputeGraph* graph) {
   write_push_constant_data();
 
 #ifdef ET_EVENT_TRACER_ENABLED
-  std::string event_name;
-  if (!operator_json.empty()) {
-    event_name += "\"operator\": {" + operator_json + "}, ";
-  }
-  event_name += "\"kernel_name\": \"" + shader_.kernel_name + "\", ";
-  event_name += "\"operator_id\": " + std::to_string(operator_count);
+  const std::string event_metadata =
+      make_dispatch_metadata_json(shader_.kernel_name, node_id_, operator_json);
 #endif
 
   context->report_shader_dispatch_start(
 #ifdef ET_EVENT_TRACER_ENABLED
-      event_name,
+      event_metadata,
 #else
       shader_.kernel_name,
 #endif

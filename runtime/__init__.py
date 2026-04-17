@@ -111,7 +111,19 @@ Example output:
 import functools
 from pathlib import Path
 from types import ModuleType
-from typing import Any, BinaryIO, Dict, List, Optional, Sequence, Set, Union
+from typing import (
+    Any,
+    BinaryIO,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 try:
     from executorch.extension.pybindings.portable_lib import (  # type: ignore[import-not-found]
@@ -125,6 +137,15 @@ except ModuleNotFoundError as e:
         "Prebuilt <site-packages>/extension/pybindings/_portable_lib.so "
         "is not found. Please reinstall ExecuTorch from pip."
     ) from e
+
+
+class DelegateDebugFocusScope(TypedDict, total=False):
+    """Instruction-scoped delegate debug focus specification."""
+
+    instruction_id: int
+    debug_handles: Sequence[int]
+    debug_handle_ranges: Sequence[Tuple[int, int]]
+    debug_names: Sequence[str]
 
 
 class Method:
@@ -217,6 +238,37 @@ class Program:
             debug_buffer_path: The path to the debug buffer file.
         """
         self._program.write_etdump_result_to_file(etdump_path, debug_buffer_path)
+
+    def reset_etdump(self) -> None:
+        """Clears the in-memory ETDump/debug trace while keeping program state intact."""
+        self._program.reset_etdump()
+
+    def set_etdump_debug_level(
+        self,
+        level: Literal["no_logging", "program_outputs", "intermediate_outputs"],
+    ) -> None:
+        """Set ETDump runtime debug verbosity."""
+        self._program.set_etdump_debug_level(level)
+
+    def set_delegate_debug_handle_focus(
+        self,
+        *,
+        debug_handles: Sequence[int] = (),
+        debug_handle_ranges: Sequence[Tuple[int, int]] = (),
+        debug_names: Sequence[str] = (),
+        scoped_debug_handles: Sequence[DelegateDebugFocusScope] = (),
+    ) -> None:
+        """Restrict delegate intermediate-output capture to specific debug handles."""
+        self._program.set_delegate_debug_handle_focus(
+            list(debug_handles),
+            list(debug_handle_ranges),
+            list(debug_names),
+            list(scoped_debug_handles),
+        )
+
+    def clear_delegate_debug_handle_focus(self) -> None:
+        """Clear any delegate-focused ETDump filter."""
+        self._program.clear_delegate_debug_handle_focus()
 
 
 class BackendRegistry:

@@ -83,7 +83,7 @@ class ExecuteNode {
   }
 
  protected:
-  uint32_t node_id_;
+  uint32_t node_id_ = UINT32_MAX;
   const ResizeFunction resize_fn_;
   const std::vector<ValueRef> resize_args_;
   const std::vector<ArgGroup> args_;
@@ -92,7 +92,6 @@ class ExecuteNode {
 
 #ifdef ET_EVENT_TRACER_ENABLED
   std::string operator_json;
-  size_t operator_count = 0;
 #endif
 };
 

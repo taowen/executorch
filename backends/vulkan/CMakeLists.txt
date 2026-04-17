@@ -41,8 +41,14 @@ set(VULKAN_HEADERS_PATH ${VULKAN_THIRD_PARTY_PATH}/Vulkan-Headers)
 set(VOLK_PATH ${VULKAN_THIRD_PARTY_PATH}/volk)
 set(VMA_PATH ${VULKAN_THIRD_PARTY_PATH}/VulkanMemoryAllocator)
 
+if(DEFINED _executorch_build_include_root)
+  set(_executorch_vulkan_build_include_root ${_executorch_build_include_root})
+else()
+  set(_executorch_vulkan_build_include_root ${EXECUTORCH_ROOT}/..)
+endif()
+
 set(COMMON_INCLUDES
-    $<BUILD_INTERFACE:${EXECUTORCH_ROOT}/..>
+    $<BUILD_INTERFACE:${_executorch_vulkan_build_include_root}>
     $<BUILD_INTERFACE:${VULKAN_HEADERS_PATH}/include>
     $<BUILD_INTERFACE:${VOLK_PATH}> $<BUILD_INTERFACE:${VMA_PATH}>
 )
@@ -123,7 +129,9 @@ add_library(vulkan_backend ${vulkan_backend_cpp})
 target_include_directories(
   vulkan_backend PRIVATE ${SCHEMA_INCLUDE_DIR} ${COMMON_INCLUDES}
 )
-target_link_libraries(vulkan_backend PRIVATE vulkan_schema executorch_core)
+target_link_libraries(
+  vulkan_backend PRIVATE vulkan_schema executorch_core extension_tensor
+)
 # Optionally link boost for stacktraces if boost is available
 if(DEFINED Boost_STACKTRACE_BASIC_LIBRARY)
   target_link_libraries(

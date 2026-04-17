@@ -1,59 +1,99 @@
 ## Summary
-[Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) support in ExecuTorch is exported through the Llama example pipeline with a hybrid layer layout:
-- `full_attention` layers use gated full attention.
-- `linear_attention` layers use Gated DeltaNet with internal recurrent state.
+[Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) is now validated in the
+pure-Vulkan `exshader` path on Linux for `0.8B`.
 
-This first bring-up is **fp32 + static shape** (`enable_dynamic_shape=False`).
-Currently supported text model sizes: `0.8B`, `2B`, `4B`.
+Current validated properties:
+- export path: Python-first `exshader.export_llm`
+- backend path: Vulkan only
+- shape mode: static shape
+- dtype path: `fp32`
+- stateful execution: validated through teacher-forced compare against eager
+
+The main bring-up bug for `qwen3_5_0_8b` was a mutable-buffer lowering mismatch:
+mutable buffers must remain runtime inputs to delegated Vulkan subgraphs and must
+not be lowered as delegate-owned buffers or prepacked constants.
 
 ## Export
-```bash
-python -m extension.llm.export.export_llm \
-  --config examples/models/qwen3_5/config/qwen3_5_xnnpack_fp32.yaml \
-  +base.model_class="qwen3_5_0_8b" \
-  +base.params="examples/models/qwen3_5/config/0_8b_config.json" \
-  +export.output_name="qwen3_5_0_8b_fp32.pte"
-```
+From the repo root:
 
 ```bash
-python -m extension.llm.export.export_llm \
-  --config examples/models/qwen3_5/config/qwen3_5_xnnpack_fp32.yaml \
-  +base.model_class="qwen3_5_2b" \
-  +base.params="examples/models/qwen3_5/config/2b_config.json" \
-  +export.output_name="qwen3_5_2b_fp32.pte"
+FLATC_EXECUTABLE="$PWD/.venv/bin/flatc" \
+PYTHONPATH="$PWD/src:$PWD" \
+./.venv/bin/python -m exshader.export_llm \
+  base.model_class=qwen3_5_0_8b \
+  base.params=examples/models/qwen3_5/config/0_8b_config.json \
+  model.enable_dynamic_shape=false \
+  model.use_kv_cache=true \
+  model.use_sdpa_with_kv_cache=false \
+  model.quantize_kv_cache=false \
+  backend.vulkan.enabled=true \
+  backend.vulkan.force_fp16=false \
+  model.dtype_override=fp32 \
+  export.max_seq_length=2048 \
+  export.max_context_length=2048 \
+  export.output_name="$PWD/artifacts/pte/qwen3_5_0_8b_vulkan_fp32_statefix_main.pte"
 ```
 
-```bash
-python -m extension.llm.export.export_llm \
-  --config examples/models/qwen3_5/config/qwen3_5_xnnpack_fp32.yaml \
-  +base.model_class="qwen3_5_4b" \
-  +base.params="examples/models/qwen3_5/config/4b_config.json" \
-  +export.output_name="qwen3_5_4b_fp32.pte"
-```
+If `+base.checkpoint` is not provided, the exporter will download and convert the
+HF checkpoint automatically.
 
-The exporter will download and convert HF weights automatically when `+base.checkpoint` is not provided.
-Install `safetensors` in your environment if it is missing:
-```bash
-python -m pip install safetensors
-```
+## Run
+Use the Qwen chat template and remember that `--max_len` is total sequence
+length, not “max new tokens”.
 
-## Run (Python Runner)
 ```bash
-python -m executorch.examples.models.llama.runner.native \
+FLATC_EXECUTABLE="$PWD/.venv/bin/flatc" \
+PYTHONPATH="$PWD/src:$PWD" \
+./.venv/bin/python -m executorch.examples.models.llama.runner.native \
   --model qwen3_5_0_8b \
-  --pte qwen3_5_0_8b_fp32.pte \
-  --tokenizer /path/to/tokenizer.json \
-  --tokenizer_config /path/to/tokenizer_config.json \
-  --prompt "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n" \
-  --params examples/models/qwen3_5/config/0_8b_config.json \
-  --max_len 128 \
+  -f artifacts/pte/qwen3_5_0_8b_vulkan_fp32_statefix_main.pte \
+  -p examples/models/qwen3_5/config/0_8b_config.json \
+  -t /home/taowen/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/tokenizer.json \
+  --tokenizer_config /home/taowen/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/tokenizer_config.json \
+  --prompt $'<|im_start|>user\nWhat is 1+1?\n<|im_end|>\n<|im_start|>assistant\n' \
+  --temperature 0 \
   -kv \
-  --temperature 0.3
+  --max_len 128
+```
+
+## Debugging
+### Teacher-Forced Compare
+Use this first before blaming Vulkan numerics:
+
+```bash
+PYTHONPATH="$PWD/src:$PWD" \
+./.venv/bin/python -m exshader.diag.llm_step_compare \
+  --model qwen3_5_0_8b \
+  --checkpoint /home/taowen/.cache/meta_checkpoints/Qwen_Qwen3.5-0.8B.pth \
+  --params examples/models/qwen3_5/config/0_8b_config.json \
+  --tokenizer /home/taowen/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/tokenizer.json \
+  --tokenizer-config /home/taowen/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/tokenizer_config.json \
+  --vulkan-pte artifacts/pte/qwen3_5_0_8b_vulkan_fp32_statefix_main.pte \
+  --prompt $'<|im_start|>user\nWhat is 1+1?\n<|im_end|>\n<|im_start|>assistant\n' \
+  --max-seq-len 128 \
+  --max-new-tokens 2 \
+  --top-k 5 \
+  --output-dir outputs/qwen35_statefix_main_compare \
+  --skip-free-run
+```
+
+Expected current outcome:
+- `first_divergence: null`
+- step 0: eager token == Vulkan token == `<think>`
+
+### ABI Diff
+When export/lowering contracts are suspicious, compare the ABI dumps instead of
+reading long logs by hand:
+
+```bash
+PYTHONPATH="$PWD/src:$PWD" \
+./.venv/bin/python -m exshader.diag.abi_diff \
+  --baseline /path/to/baseline.jsonl \
+  --candidate /path/to/candidate.jsonl
 ```
 
 ## Notes
-- Current path targets CPU/XNNPACK export validation and runner compatibility.
-- `q8da4w` quantization for Qwen3.5 is intentionally deferred to a follow-up.
-- Dynamic-shape export is not enabled yet for Qwen3.5 DeltaNet layers in this path; keep `enable_dynamic_shape=False`.
-- For static-shape exports, `runner.native` falls back to sequential token prefill for multi-token prompts.
-- Default metadata uses Qwen3.5 special token ids: `get_bos_id=248045`, `get_eos_ids=[248046,248044]`.
+- The validated path here is **pure Vulkan**, not CPU/XNNPACK.
+- Static-shape export is still the validated mode for `qwen3_5_0_8b`.
+- If output text is wrong, check prompt template, tokenizer pairing, and
+  sequence budget before investigating the backend.

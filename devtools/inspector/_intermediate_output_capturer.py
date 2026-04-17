@@ -7,7 +7,7 @@
 # pyre-unsafe
 
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Set
 
 import torch
 from executorch.devtools.inspector._inspector_utils import DebugHandle, NodeFilter
@@ -23,11 +23,16 @@ class IntermediateOutputCapturer(Interpreter):
         node_filters (List[NodeFilter]): A list of filters to apply to the nodes.
     """
 
-    def __init__(self, module: GraphModule):
+    def __init__(
+        self,
+        module: GraphModule,
+        debug_handle_allowlist: Optional[Set[DebugHandle]] = None,
+    ):
         super().__init__(module)
         self.node_filters = [
             NodeFilter("debug_handle", "call_function", exclude_ops=["getitem"])
         ]
+        self.debug_handle_allowlist = debug_handle_allowlist
 
     # Runs the graph module and captures the intermediate outputs.
     def run_and_capture(self, *args, **kwargs) -> Dict[DebugHandle, Any]:
@@ -43,6 +48,11 @@ class IntermediateOutputCapturer(Interpreter):
                     if isinstance(debug_handle, int)
                     else tuple(debug_handle)
                 )
+                if (
+                    self.debug_handle_allowlist is not None
+                    and key not in self.debug_handle_allowlist
+                ):
+                    return result
                 # Handle tensor results by detaching and cloning
                 if isinstance(result, torch.Tensor):
                     captured_outputs[key] = result.detach().clone()

@@ -362,48 +362,64 @@ runtime::Error Module::load_method(
     const LoadBackendOptionsMap* effective_backend_options =
         backend_options ? backend_options : backend_options_;
 
-    MethodHolder method_holder;
+    try {
+      MethodHolder method_holder;
 
-    if (!planned_memory) {
-      if (!share_memory_arenas_) {
-        auto sizes_res = get_mem_planned_buffer_sizes(method_name);
-        ET_CHECK_OK_OR_RETURN_ERROR(sizes_res.error());
-        method_holder.planned_memory = make_planned_memory(sizes_res.get());
-      } else {
-        auto sizes_res = get_mem_planned_buffer_sizes(method_name);
-        ET_CHECK_OK_OR_RETURN_ERROR(sizes_res.error());
-        auto& sizes = sizes_res.get();
-        if (shared_arenas_.empty()) {
-          auto max_res = get_max_mem_planned_buffer_sizes();
-          ET_CHECK_OK_OR_RETURN_ERROR(max_res.error());
-          auto& max_sizes = max_res.get();
-          // Only share for mem_id=1,2.
-          size_t shared = (max_sizes.size() > 2) ? 2 : max_sizes.size();
-          for (size_t i = 0; i < shared; i++) {
-            shared_arenas_.emplace_back(max_sizes[i]);
+      if (!planned_memory) {
+        try {
+          if (!share_memory_arenas_) {
+            auto sizes_res = get_mem_planned_buffer_sizes(method_name);
+            ET_CHECK_OK_OR_RETURN_ERROR(sizes_res.error());
+            method_holder.planned_memory = make_planned_memory(sizes_res.get());
+          } else {
+            auto sizes_res = get_mem_planned_buffer_sizes(method_name);
+            ET_CHECK_OK_OR_RETURN_ERROR(sizes_res.error());
+            auto& sizes = sizes_res.get();
+            if (shared_arenas_.empty()) {
+              auto max_res = get_max_mem_planned_buffer_sizes();
+              ET_CHECK_OK_OR_RETURN_ERROR(max_res.error());
+              auto& max_sizes = max_res.get();
+              // Only share for mem_id=1,2.
+              size_t shared = (max_sizes.size() > 2) ? 2 : max_sizes.size();
+              for (size_t i = 0; i < shared; i++) {
+                shared_arenas_.emplace_back(max_sizes[i]);
+              }
+            }
+            method_holder.planned_memory =
+                make_planned_memory_with_shared_arenas(sizes, shared_arenas_);
           }
+        } catch (const std::exception& e) {
+          throw std::runtime_error(
+              "Module::load_method(" + method_name +
+              ") failed during planned memory setup: " + std::string(e.what()));
         }
-        method_holder.planned_memory =
-            make_planned_memory_with_shared_arenas(sizes, shared_arenas_);
+        planned_memory = method_holder.planned_memory->planned_memory.get();
       }
-      planned_memory = method_holder.planned_memory->planned_memory.get();
-    }
 
-    method_holder.memory_manager = std::make_unique<runtime::MemoryManager>(
-        memory_allocator_.get(), planned_memory, temp_allocator_.get());
-    auto res_method = program_->load_method(
-        method_name.c_str(),
-        method_holder.memory_manager.get(),
-        event_tracer ? event_tracer : this->event_tracer(),
-        merged_data_map_.get(),
-        effective_backend_options);
-    if (!res_method.ok()) {
-      return res_method.error();
+      method_holder.memory_manager = std::make_unique<runtime::MemoryManager>(
+          memory_allocator_.get(), planned_memory, temp_allocator_.get());
+      try {
+        auto res_method = program_->load_method(
+            method_name.c_str(),
+            method_holder.memory_manager.get(),
+            event_tracer ? event_tracer : this->event_tracer(),
+            merged_data_map_.get(),
+            effective_backend_options);
+        if (!res_method.ok()) {
+          return res_method.error();
+        }
+        method_holder.method =
+            std::make_unique<std::remove_reference_t<decltype(*res_method)>>(
+                std::move(*res_method));
+      } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "Module::load_method(" + method_name +
+            ") failed during program_->load_method: " + std::string(e.what()));
+      }
+      methods_.emplace(method_name, std::move(method_holder));
+    } catch (const std::exception& e) {
+      throw;
     }
-    method_holder.method =
-        std::make_unique<std::remove_reference_t<decltype(*res_method)>>(
-            std::move(*res_method));
-    methods_.emplace(method_name, std::move(method_holder));
   }
   return runtime::Error::Ok;
 }
@@ -425,14 +441,34 @@ runtime::Result<std::vector<runtime::EValue>> Module::execute(
     const std::vector<runtime::EValue>& input_values) {
   ET_CHECK_OK_OR_RETURN_ERROR(load_method(method_name));
   auto& method = methods_.at(method_name).method;
-  for (auto index = 0; index < input_values.size(); ++index) {
-    ET_CHECK_OK_OR_RETURN_ERROR(method->set_input(input_values[index], index));
+  try {
+    for (auto index = 0; index < input_values.size(); ++index) {
+      ET_CHECK_OK_OR_RETURN_ERROR(method->set_input(input_values[index], index));
+    }
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        "Module::execute(" + method_name + ") failed during set_input: " +
+        std::string(e.what()));
   }
-  ET_CHECK_OK_OR_RETURN_ERROR(method->execute());
+
+  try {
+    ET_CHECK_OK_OR_RETURN_ERROR(method->execute());
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        "Module::execute(" + method_name + ") failed during method->execute(): " +
+        std::string(e.what()));
+  }
+
   const auto outputs_size = method->outputs_size();
   std::vector<runtime::EValue> outputs(outputs_size);
-  ET_CHECK_OK_OR_RETURN_ERROR(
-      method->get_outputs(outputs.data(), outputs_size));
+  try {
+    ET_CHECK_OK_OR_RETURN_ERROR(
+        method->get_outputs(outputs.data(), outputs_size));
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        "Module::execute(" + method_name + ") failed during method->get_outputs(): " +
+        std::string(e.what()));
+  }
 
   return outputs;
 }

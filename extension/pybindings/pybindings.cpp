@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <unordered_set>
 
 #include <pybind11/iostream.h>
 #include <pybind11/pybind11.h>
@@ -115,6 +116,216 @@ namespace pybindings {
 
 namespace {
 
+class DelegateFocusedETDumpFilter final
+    : public ::executorch::runtime::EventTracerFilterBase {
+ public:
+  struct ScopedRule final {
+    ::executorch::runtime::DebugHandle instruction_id;
+    std::unordered_set<::executorch::runtime::DelegateDebugIntId>
+        exact_debug_handles;
+    std::vector<
+        std::pair<
+            ::executorch::runtime::DelegateDebugIntId,
+            ::executorch::runtime::DelegateDebugIntId>>
+        debug_handle_ranges;
+    std::unordered_set<std::string> exact_debug_names;
+
+    bool matches(
+        const char* name,
+        ::executorch::runtime::DelegateDebugIntId delegate_debug_index) const {
+      if (exact_debug_handles.empty() && debug_handle_ranges.empty() &&
+          exact_debug_names.empty()) {
+        return true;
+      }
+
+      if (name != nullptr && exact_debug_names.count(name) > 0) {
+        return true;
+      }
+
+      if (delegate_debug_index !=
+          ::executorch::runtime::kUnsetDelegateDebugIntId) {
+        if (exact_debug_handles.count(delegate_debug_index) > 0) {
+          return true;
+        }
+
+        for (const auto& range : debug_handle_ranges) {
+          if (delegate_debug_index >= range.first &&
+              delegate_debug_index < range.second) {
+            return true;
+          }
+        }
+      }
+
+      return false;
+    }
+  };
+
+  void clear() {
+    exact_debug_handles_.clear();
+    debug_handle_ranges_.clear();
+    exact_debug_names_.clear();
+    scoped_rules_.clear();
+  }
+
+  void add_debug_handle(
+      ::executorch::runtime::DelegateDebugIntId debug_handle) {
+    exact_debug_handles_.insert(debug_handle);
+  }
+
+  void add_debug_handle_range(
+      ::executorch::runtime::DelegateDebugIntId start,
+      ::executorch::runtime::DelegateDebugIntId end) {
+    debug_handle_ranges_.emplace_back(start, end);
+  }
+
+  void add_debug_name(const std::string& debug_name) {
+    exact_debug_names_.insert(debug_name);
+  }
+
+  void add_scoped_rule(ScopedRule scoped_rule) {
+    scoped_rules_.emplace_back(std::move(scoped_rule));
+  }
+
+  bool empty() const {
+    return exact_debug_handles_.empty() && debug_handle_ranges_.empty() &&
+        exact_debug_names_.empty() && scoped_rules_.empty();
+  }
+
+  Result<bool> filter(
+      const char* name,
+      ::executorch::runtime::DelegateDebugIntId delegate_debug_index)
+      override {
+    (void)name;
+    (void)delegate_debug_index;
+    if (empty()) {
+      return false;
+    }
+    return true;
+  }
+
+  Result<bool> filter_delegate(
+      const char* name,
+      ::executorch::runtime::DelegateDebugIntId delegate_debug_index,
+      ::executorch::runtime::DebugHandle instruction_id) override {
+    if (empty()) {
+      return false;
+    }
+
+    if (matches_global(name, delegate_debug_index)) {
+      return false;
+    }
+
+    for (const auto& rule : scoped_rules_) {
+      if (rule.instruction_id == instruction_id &&
+          rule.matches(name, delegate_debug_index)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+ private:
+  bool matches_global(
+      const char* name,
+      ::executorch::runtime::DelegateDebugIntId delegate_debug_index) const {
+    if (name != nullptr && exact_debug_names_.count(name) > 0) {
+      return true;
+    }
+
+    if (delegate_debug_index ==
+        ::executorch::runtime::kUnsetDelegateDebugIntId) {
+      return false;
+    }
+
+    if (exact_debug_handles_.count(delegate_debug_index) > 0) {
+      return true;
+    }
+
+    for (const auto& range : debug_handle_ranges_) {
+      if (delegate_debug_index >= range.first &&
+          delegate_debug_index < range.second) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  std::unordered_set<::executorch::runtime::DelegateDebugIntId>
+      exact_debug_handles_;
+  std::vector<
+      std::pair<
+          ::executorch::runtime::DelegateDebugIntId,
+          ::executorch::runtime::DelegateDebugIntId>>
+      debug_handle_ranges_;
+  std::unordered_set<std::string> exact_debug_names_;
+  std::vector<ScopedRule> scoped_rules_;
+};
+
+std::vector<DelegateFocusedETDumpFilter::ScopedRule> parse_scoped_delegate_focus(
+    const py::sequence& scoped_debug_handles) {
+  std::vector<DelegateFocusedETDumpFilter::ScopedRule> scoped_rules;
+  scoped_rules.reserve(py::len(scoped_debug_handles));
+
+  for (const py::handle item : scoped_debug_handles) {
+    if (!py::isinstance<py::dict>(item)) {
+      throw std::runtime_error(
+          "scoped_debug_handles entries must be dicts containing instruction_id and optional debug_handles/debug_handle_ranges/debug_names");
+    }
+    py::dict spec = py::reinterpret_borrow<py::dict>(item);
+
+    if (!spec.contains("instruction_id")) {
+      throw std::runtime_error(
+          "scoped_debug_handles entries must include instruction_id");
+    }
+
+    const int64_t instruction_id = py::cast<int64_t>(spec["instruction_id"]);
+    if (instruction_id < 0) {
+      throw std::runtime_error("instruction_id must be non-negative");
+    }
+
+    DelegateFocusedETDumpFilter::ScopedRule rule;
+    rule.instruction_id = instruction_id;
+
+    if (spec.contains("debug_handles")) {
+      for (const py::handle value : py::cast<py::sequence>(spec["debug_handles"])) {
+        const int64_t debug_handle = py::cast<int64_t>(value);
+        if (debug_handle < 0) {
+          throw std::runtime_error("debug handle must be non-negative");
+        }
+        rule.exact_debug_handles.insert(debug_handle);
+      }
+    }
+
+    if (spec.contains("debug_handle_ranges")) {
+      for (const py::handle value :
+           py::cast<py::sequence>(spec["debug_handle_ranges"])) {
+        const auto range = py::cast<std::pair<int64_t, int64_t>>(value);
+        if (range.first < 0 || range.second < 0 || range.first >= range.second) {
+          throw std::runtime_error(
+              "debug handle ranges must satisfy 0 <= start < end");
+        }
+        rule.debug_handle_ranges.emplace_back(range.first, range.second);
+      }
+    }
+
+    if (spec.contains("debug_names")) {
+      for (const py::handle value : py::cast<py::sequence>(spec["debug_names"])) {
+        const std::string debug_name = py::cast<std::string>(value);
+        if (debug_name.empty()) {
+          throw std::runtime_error("debug name must be non-empty");
+        }
+        rule.exact_debug_names.insert(debug_name);
+      }
+    }
+
+    scoped_rules.emplace_back(std::move(rule));
+  }
+
+  return scoped_rules;
+}
+
 void write_data_to_file(const std::string& path, void* buf, size_t size) {
   FILE* f = fopen(path.c_str(), "w+");
   if (!f) {
@@ -130,6 +341,44 @@ void write_data_to_file(const std::string& path, void* buf, size_t size) {
   if (err) {
     throw std::runtime_error(
         "Failed to close etdump file " + path + ": " + strerror(err));
+  }
+}
+
+bool pybindings_trace_enabled() {
+  const char* env = std::getenv("ET_PYBINDINGS_TRACE");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+void populate_etensor_metadata_from_aten(
+    const at::Tensor& at_tensor,
+    std::vector<torch::executor::Tensor::SizesType>& sizes,
+    std::vector<torch::executor::Tensor::StridesType>& strides,
+    std::vector<torch::executor::Tensor::DimOrderType>& dim_order,
+    const std::string& input_name) {
+  const size_t dim = at_tensor.dim();
+  sizes.assign(at_tensor.sizes().begin(), at_tensor.sizes().end());
+  strides.assign(at_tensor.strides().begin(), at_tensor.strides().end());
+
+  dim_order.clear();
+  if (at_tensor.is_contiguous()) {
+    for (size_t cur_dim = 0; cur_dim < dim; cur_dim++) {
+      dim_order.push_back(cur_dim);
+    }
+  } else if (
+      at_tensor.is_contiguous(at::MemoryFormat::ChannelsLast) &&
+      at_tensor.dim() == 4) {
+    dim_order = {0, 2, 3, 1};
+  } else {
+    throw std::runtime_error(
+        input_name + " should be contiguous or channels-last.");
+  }
+
+  // Rank-0 tensors are valid ET inputs, but the portable bridge requires these
+  // metadata pointers to be non-null even when `dim == 0`.
+  if (dim == 0) {
+    sizes.push_back(1);
+    strides.push_back(1);
+    dim_order.push_back(0);
   }
 }
 
@@ -728,6 +977,9 @@ struct PyModule final {
       const std::string& method_name,
       const py::sequence& inputs,
       bool clone_outputs = true) {
+    if (pybindings_trace_enabled()) {
+      std::cerr << "[pybindings] run_method begin: " << method_name << std::endl;
+    }
     const auto inputs_size = py::len(inputs);
     std::vector<EValue> cpp_inputs;
     cpp_inputs.reserve(inputs_size);
@@ -748,83 +1000,100 @@ struct PyModule final {
     input_tensors.reserve(inputs_size);
 #endif
 
-    // Convert python objects into EValues.
-    for (size_t i = 0; i < inputs_size; ++i) {
-      auto python_input = inputs[i];
-      const std::string& type_str = py::str(python_input.get_type());
-      if (type_str == "<class 'torch.Tensor'>") {
-        auto at_tensor = python_input.cast<at::Tensor>();
+    try {
+      // Convert python objects into EValues.
+      for (size_t i = 0; i < inputs_size; ++i) {
+        auto python_input = inputs[i];
+        const std::string& type_str = py::str(python_input.get_type());
+        if (type_str == "<class 'torch.Tensor'>") {
+          auto at_tensor = python_input.cast<at::Tensor>();
 
 #ifdef USE_ATEN_LIB
-        EValue evalue(at_tensor);
+          EValue evalue(at_tensor);
 #else
-        // convert at::Tensor to torch::executor::Tensor
-        auto type =
-            torch_to_executorch_scalar_type(at_tensor.options().dtype());
-        size_t dim = at_tensor.dim();
-        // cant directly alias at::Tensor sizes and strides due to int64 vs
-        // int32 typing conflict
-        input_sizes.emplace_back(
-            at_tensor.sizes().begin(), at_tensor.sizes().end());
-        input_strides.emplace_back(
-            at_tensor.strides().begin(), at_tensor.strides().end());
+          // convert at::Tensor to torch::executor::Tensor
+          auto type =
+              torch_to_executorch_scalar_type(at_tensor.options().dtype());
+          size_t dim = at_tensor.dim();
+          input_sizes.emplace_back();
+          input_strides.emplace_back();
+          input_dim_order.emplace_back();
+          populate_etensor_metadata_from_aten(
+              at_tensor,
+              input_sizes.back(),
+              input_strides.back(),
+              input_dim_order.back(),
+              "Input " + std::to_string(i) + " for method " + method_name);
+          input_tensors.emplace_back(
+              type,
+              dim,
+              input_sizes.back().data(),
+              nullptr,
+              input_dim_order.back().data(),
+              input_strides.back().data());
 
-        // Only works for MemoryFormat::Contiguous or MemoryFormat::ChannelsLast
-        // inputs
-        std::vector<torch::executor::Tensor::DimOrderType> dim_order;
-        if (at_tensor.is_contiguous()) {
-          for (size_t cur_dim = 0; cur_dim < dim; cur_dim++) {
-            dim_order.push_back(cur_dim);
-          }
-        } else if (
-            at_tensor.is_contiguous(at::MemoryFormat::ChannelsLast) &&
-            at_tensor.dim() == 4) {
-          dim_order = decltype(dim_order)({0, 2, 3, 1});
-        } else {
-          auto error_msg = "Input " + std::to_string(i) + "for method " +
-              method_name + " should be contiguous or channels-last.";
-          throw std::runtime_error(error_msg);
-        }
-        input_dim_order.push_back(std::move(dim_order));
-        input_tensors.emplace_back(
-            type,
-            dim,
-            input_sizes.back().data(),
-            nullptr,
-            input_dim_order.back().data(),
-            input_strides.back().data());
-
-        torch::executor::Tensor temp =
-            torch::executor::Tensor(&input_tensors.back());
-        alias_etensor_to_attensor(at_tensor, temp);
-        EValue evalue(temp);
+          torch::executor::Tensor temp =
+              torch::executor::Tensor(&input_tensors.back());
+          alias_etensor_to_attensor(at_tensor, temp);
+          EValue evalue(temp);
 #endif
 
-        cpp_inputs.push_back(evalue);
-      } else if (py::isinstance<py::none>(python_input)) {
-        cpp_inputs.push_back(EValue());
-      } else if (py::isinstance<py::bool_>(python_input)) {
-        cpp_inputs.push_back(EValue(py::cast<bool>(python_input)));
-      } else if (py::isinstance<py::int_>(python_input)) {
-        cpp_inputs.push_back(EValue(py::cast<int64_t>(python_input)));
-      } else {
-        throw std::runtime_error(
-            "Unsupported python type " + type_str +
-            ". Ensure that inputs are passed as a flat list of tensors.");
+          cpp_inputs.push_back(evalue);
+        } else if (py::isinstance<py::none>(python_input)) {
+          cpp_inputs.push_back(EValue());
+        } else if (py::isinstance<py::bool_>(python_input)) {
+          cpp_inputs.push_back(EValue(py::cast<bool>(python_input)));
+        } else if (py::isinstance<py::int_>(python_input)) {
+          cpp_inputs.push_back(EValue(py::cast<int64_t>(python_input)));
+        } else {
+          throw std::runtime_error(
+              "Unsupported python type " + type_str +
+              ". Ensure that inputs are passed as a flat list of tensors.");
+        }
       }
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          "PyModule::run_method(" + method_name +
+          ") failed during input conversion: " + std::string(e.what()));
+    }
+    if (pybindings_trace_enabled()) {
+      std::cerr << "[pybindings] input conversion done: " << method_name
+                << std::endl;
     }
 
-    // Set up output storage before execution.
-    allocate_output_tensors(method_name);
-    auto outputs = module_->execute(method_name, cpp_inputs);
+    try {
+      // Set up output storage before execution.
+      allocate_output_tensors(method_name);
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          "PyModule::run_method(" + method_name +
+          ") failed during allocate_output_tensors: " + std::string(e.what()));
+    }
+    if (pybindings_trace_enabled()) {
+      std::cerr << "[pybindings] allocate_output_tensors done: " << method_name
+                << std::endl;
+    }
+
+    std::optional<runtime::Result<std::vector<EValue>>> outputs;
+    try {
+      outputs.emplace(module_->execute(method_name, cpp_inputs));
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          "PyModule::run_method(" + method_name +
+          ") failed during module_->execute: " + std::string(e.what()));
+    }
+    if (pybindings_trace_enabled()) {
+      std::cerr << "[pybindings] module_->execute done: " << method_name
+                << std::endl;
+    }
     THROW_IF_ERROR(
-        outputs.error(),
+        outputs->error(),
         "Failed to execute method %s, error: 0x%" PRIx32,
         method_name.c_str(),
-        static_cast<uint32_t>(outputs.error()));
+        static_cast<uint32_t>(outputs->error()));
 
     // Retrieve outputs
-    return get_outputs_as_py_list(outputs.get(), clone_outputs);
+    return get_outputs_as_py_list(outputs->get(), clone_outputs);
   }
 
   py::list forward(const py::sequence& inputs, bool clone_outputs = true) {
@@ -1094,30 +1363,16 @@ struct PyMethod final {
         auto type =
             torch_to_executorch_scalar_type(at_tensor.options().dtype());
         size_t dim = at_tensor.dim();
-        // cant directly alias at::Tensor sizes and strides due to int64 vs
-        // int32 typing conflict
-        std::vector<int> sizes(
-            at_tensor.sizes().begin(), at_tensor.sizes().end());
-        std::vector<int> strides(
-            at_tensor.strides().begin(), at_tensor.strides().end());
-
-        // Only works for MemoryFormat::Contiguous or MemoryFormat::ChannelsLast
-        // inputs
+        std::vector<torch::executor::Tensor::SizesType> sizes;
+        std::vector<torch::executor::Tensor::StridesType> strides;
         std::vector<torch::executor::Tensor::DimOrderType> dim_order;
-        if (at_tensor.is_contiguous()) {
-          for (size_t cur_dim = 0; cur_dim < dim; cur_dim++) {
-            dim_order.push_back(cur_dim);
-          }
-        } else if (
-            at_tensor.is_contiguous(at::MemoryFormat::ChannelsLast) &&
-            at_tensor.dim() == 4) {
-          dim_order = decltype(dim_order)({0, 2, 3, 1});
-        } else {
-          auto error_msg = "Input " + std::to_string(i) + "for method " +
-              method_->method_meta().name() +
-              " should be contiguous or channels-last.";
-          throw std::runtime_error(error_msg);
-        }
+        populate_etensor_metadata_from_aten(
+            at_tensor,
+            sizes,
+            strides,
+            dim_order,
+            "Input " + std::to_string(i) + " for method " +
+                method_->method_meta().name());
         TensorPtr tensor =
             for_blob(at_tensor.data_ptr(), std::move(sizes), type)
                 .strides(std::move(strides))
@@ -1416,15 +1671,47 @@ struct PyProgram final {
   }
 
   std::unique_ptr<PyMethod> load_method(const std::string& method_name) {
-    Result<Method> res = state_->program_->load_method(
-        method_name.c_str(), memory_->mem_manager(), event_tracer_.get());
+    Result<Method> res = [&]() -> Result<Method> {
+      try {
+        return state_->program_->load_method(
+            method_name.c_str(), memory_->mem_manager(), event_tracer_.get());
+      } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "PyProgram::load_method(" + method_name +
+            ") failed during Program::load_method: " + std::string(e.what()));
+      }
+    }();
+
+    Error err = Error::Ok;
+    try {
+      err = res.error();
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          "PyProgram::load_method(" + method_name +
+          ") failed while reading Result::error(): " + std::string(e.what()));
+    }
     THROW_IF_ERROR(
-        res.error(),
+        err,
         "Failed to load method %s, error: 0x:%" PRIx32,
         method_name.c_str(),
-        static_cast<uint32_t>(res.error()));
-    return std::make_unique<PyMethod>(
-        memory_, state_, std::make_unique<Method>(std::move(res.get())));
+        static_cast<uint32_t>(err));
+
+    std::unique_ptr<Method> method;
+    try {
+      method = std::make_unique<Method>(std::move(res.get()));
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          "PyProgram::load_method(" + method_name +
+          ") failed while materializing Method: " + std::string(e.what()));
+    }
+
+    try {
+      return std::make_unique<PyMethod>(memory_, state_, std::move(method));
+    } catch (const std::exception& e) {
+      throw std::runtime_error(
+          "PyProgram::load_method(" + method_name +
+          ") failed while constructing PyMethod: " + std::string(e.what()));
+    }
   }
 
   Span<uint8_t> get_etdump_debug_buffer() {
@@ -1444,6 +1731,93 @@ struct PyProgram final {
 
   bool has_etdump() {
     return static_cast<bool>(event_tracer_);
+  }
+
+  void set_etdump_debug_level(const std::string& level) {
+    if (!has_etdump()) {
+      throw std::runtime_error("No etdump found");
+    }
+
+    if (level == "no_logging") {
+      event_tracer_->set_event_tracer_debug_level(
+          EventTracerDebugLogLevel::kNoLogging);
+      return;
+    }
+    if (level == "program_outputs") {
+      event_tracer_->set_event_tracer_debug_level(
+          EventTracerDebugLogLevel::kProgramOutputs);
+      return;
+    }
+    if (level == "intermediate_outputs") {
+      event_tracer_->set_event_tracer_debug_level(
+          EventTracerDebugLogLevel::kIntermediateOutputs);
+      return;
+    }
+
+    throw std::runtime_error(
+        "Invalid etdump debug level: expected no_logging, program_outputs, or intermediate_outputs");
+  }
+
+  void set_delegate_debug_handle_focus(
+      const std::vector<int64_t>& debug_handles,
+      const std::vector<std::pair<int64_t, int64_t>>& debug_handle_ranges,
+      const std::vector<std::string>& debug_names,
+      const py::sequence& scoped_debug_handles) {
+    if (!has_etdump()) {
+      throw std::runtime_error("No etdump found");
+    }
+
+    if (!delegate_focus_filter_) {
+      delegate_focus_filter_ = std::make_unique<DelegateFocusedETDumpFilter>();
+    }
+    delegate_focus_filter_->clear();
+
+    for (const int64_t debug_handle : debug_handles) {
+      if (debug_handle < 0) {
+        throw std::runtime_error("debug handle must be non-negative");
+      }
+      delegate_focus_filter_->add_debug_handle(debug_handle);
+    }
+
+    for (const auto& range : debug_handle_ranges) {
+      if (range.first < 0 || range.second < 0 || range.first >= range.second) {
+        throw std::runtime_error(
+            "debug handle ranges must satisfy 0 <= start < end");
+      }
+      delegate_focus_filter_->add_debug_handle_range(range.first, range.second);
+    }
+
+    for (const std::string& debug_name : debug_names) {
+      if (debug_name.empty()) {
+        throw std::runtime_error("debug name must be non-empty");
+      }
+      delegate_focus_filter_->add_debug_name(debug_name);
+    }
+
+    for (auto scoped_rule : parse_scoped_delegate_focus(scoped_debug_handles)) {
+      delegate_focus_filter_->add_scoped_rule(std::move(scoped_rule));
+    }
+
+    if (delegate_focus_filter_->empty()) {
+      event_tracer_->set_intermediate_output_filter(nullptr);
+      event_tracer_->set_delegation_intermediate_output_filter(nullptr);
+      return;
+    }
+
+    event_tracer_->set_intermediate_output_filter(delegate_focus_filter_.get());
+    event_tracer_->set_delegation_intermediate_output_filter(
+        delegate_focus_filter_.get());
+  }
+
+  void clear_delegate_debug_handle_focus() {
+    if (!has_etdump()) {
+      throw std::runtime_error("No etdump found");
+    }
+    if (delegate_focus_filter_) {
+      delegate_focus_filter_->clear();
+    }
+    event_tracer_->set_intermediate_output_filter(nullptr);
+    event_tracer_->set_delegation_intermediate_output_filter(nullptr);
   }
 
   void write_etdump_result_to_file(
@@ -1475,10 +1849,24 @@ struct PyProgram final {
     }
   }
 
+  void reset_etdump() {
+    if (!has_etdump()) {
+      throw std::runtime_error("No etdump found");
+    }
+    event_tracer_->reset();
+    if (debug_buffer_size_ > 0) {
+      const auto result = event_tracer_->set_debug_buffer(get_etdump_debug_buffer());
+      THROW_IF_ERROR(
+          result.error(),
+          "Failed to restore ETDump debug buffer after reset");
+    }
+  }
+
  private:
   std::shared_ptr<ProgramMemory> memory_;
   std::shared_ptr<ProgramState> state_;
   std::unique_ptr<ETDumpGen> event_tracer_;
+  std::unique_ptr<DelegateFocusedETDumpFilter> delegate_focus_filter_;
   std::unique_ptr<uint8_t[]> debug_buffer_;
   size_t debug_buffer_size_;
 };
@@ -1747,10 +2135,32 @@ PYBIND11_MODULE(EXECUTORCH_PYTHON_MODULE_NAME, m) {
           call_guard)
       .def("has_etdump", &PyProgram::has_etdump, call_guard)
       .def(
+          "set_etdump_debug_level",
+          &PyProgram::set_etdump_debug_level,
+          py::arg("level"),
+          call_guard)
+      .def(
+          "set_delegate_debug_handle_focus",
+          &PyProgram::set_delegate_debug_handle_focus,
+          py::arg("debug_handles") = std::vector<int64_t>{},
+          py::arg("debug_handle_ranges") =
+              std::vector<std::pair<int64_t, int64_t>>{},
+          py::arg("debug_names") = std::vector<std::string>{},
+          py::arg("scoped_debug_handles") = py::tuple(),
+          call_guard)
+      .def(
+          "clear_delegate_debug_handle_focus",
+          &PyProgram::clear_delegate_debug_handle_focus,
+          call_guard)
+      .def(
           "write_etdump_result_to_file",
           &PyProgram::write_etdump_result_to_file,
           py::arg("path"),
           py::arg("debug_buffer_path") = py::none(),
+          call_guard)
+      .def(
+          "reset_etdump",
+          &PyProgram::reset_etdump,
           call_guard);
   py::class_<PyMethod>(m, "ExecuTorchMethod")
       .def("set_inputs", &PyMethod::set_inputs, py::arg("inputs"), call_guard)

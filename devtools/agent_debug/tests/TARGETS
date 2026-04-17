@@ -1,0 +1,27 @@
+load("@fbcode_macros//build_defs:python_unittest.bzl", "python_unittest")
+
+oncall("executorch")
+
+python_unittest(
+    name = "test_core",
+    srcs = [
+        "test_core.py",
+    ],
+    deps = [
+        "//caffe2:torch",
+        "//executorch/devtools/agent_debug:core",
+        "//executorch/exir:lib",
+        "//executorch/extension/pybindings/test:make_test",
+        "//executorch/runtime:runtime",
+    ],
+)
+
+python_unittest(
+    name = "test_delegate_abi",
+    srcs = [
+        "test_delegate_abi.py",
+    ],
+    deps = [
+        "//executorch/devtools/agent_debug:core",
+    ],
+)

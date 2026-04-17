@@ -423,6 +423,63 @@ class TestInspectorUtils(unittest.TestCase):
                     break
             self.assertTrue(found)
 
+    def test_map_runtime_aot_intermediate_outputs_skips_empty_runtime_sequence(self):
+        # Some runtime debug entries can have num_outputs > 0 with empty payload.
+        # Mapping should skip them instead of raising on negative indexing.
+        aot_intermediate_outputs = {(1,): 100, (2,): 200}
+        runtime_intermediate_outputs = {(1,): ([], 3), (2,): (250, 1)}
+
+        actual = map_runtime_aot_intermediate_outputs(
+            aot_intermediate_outputs, runtime_intermediate_outputs
+        )
+
+        expected = {
+            ((2,), 200): ((2,), 250),
+        }
+        self.assertEqual(actual, expected)
+
+    def test_map_runtime_aot_intermediate_outputs_clamps_overreported_num_outputs(self):
+        # Some runtime debug entries can over-report num_outputs. Mapping should
+        # clamp to available sequence elements and avoid out-of-range indexing.
+        aot_intermediate_outputs = {
+            (2,): torch.randn(1, 1, 2, 128),
+        }
+        runtime_good = torch.randn(1, 1, 2, 128)
+        runtime_bad = torch.randn(1, 1, 2, 16)
+        runtime_intermediate_outputs = {
+            (1, 2, 3): ([runtime_bad, runtime_good], 5),
+        }
+
+        actual = map_runtime_aot_intermediate_outputs(
+            aot_intermediate_outputs, runtime_intermediate_outputs
+        )
+
+        self.assertEqual(len(actual), 1)
+        (_, mapped_aot), (_, mapped_runtime) = next(iter(actual.items()))
+        self.assertTrue(torch.allclose(mapped_aot, aot_intermediate_outputs[(2,)]))
+        self.assertTrue(torch.allclose(mapped_runtime, runtime_good))
+
+    def test_map_runtime_aot_intermediate_outputs_skips_missing_runtime_outputs(self):
+        aot_intermediate_outputs = {
+            (1,): torch.tensor([1, 2, 3]),
+            (2,): torch.tensor([4, 5, 6]),
+        }
+        runtime_intermediate_outputs = {
+            (1, 2): ([torch.tensor([1, 2, 3])], 2),
+        }
+        actual = map_runtime_aot_intermediate_outputs(
+            aot_intermediate_outputs, runtime_intermediate_outputs
+        )
+
+        self.assertEqual(len(actual), 1)
+        ((aot_key, aot_value), (runtime_key, runtime_value)) = next(
+            iter(actual.items())
+        )
+        self.assertEqual(aot_key, (1, 2))
+        self.assertEqual(runtime_key, (1, 2))
+        self.assertTrue(torch.allclose(aot_value, torch.tensor([4, 5, 6])))
+        self.assertTrue(torch.allclose(runtime_value, torch.tensor([1, 2, 3])))
+
     def test_convert_input_to_tensor_convertible_inputs(self):
         # Scalar -> tensor
         actual_output1 = convert_to_float_tensor(5)
