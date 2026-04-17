@@ -570,6 +570,190 @@ def export_llama(  # noqa: C901
         return filename
 
 
+def _enum_value(value):
+    return value.value if hasattr(value, "value") else value
+
+
+def validate_vulkan_export_args(
+    *,
+    max_seq_length: int,
+    max_context_length: int,
+    enabled_backends: List[str],
+    use_shared_embedding: bool = False,
+    embedding_quantize: Optional[str] = None,
+    multimethod_enabled: bool = False,
+    lora_config=None,
+    pt2e_quantize=None,
+) -> None:
+    if max_context_length < max_seq_length:
+        raise ValueError(
+            f"max_context_length {max_context_length} must be >= max_seq_len {max_seq_length}. max_context_length impacts kv cache size that is used to remember history, while max_seq_length refers to user prompt length. Please use --max_context_length to specify context length."
+        )
+    if "vulkan" not in enabled_backends:
+        raise ValueError(
+            "This branch only supports Vulkan export. Set backend.vulkan.enabled=true."
+        )
+
+    non_vulkan_enabled = [name for name in enabled_backends if name != "vulkan"]
+    if non_vulkan_enabled:
+        raise ValueError(
+            "Only Vulkan backend is supported in this branch. "
+            f"Disable: {', '.join(non_vulkan_enabled)}"
+        )
+
+    if use_shared_embedding:
+        if not (
+            embedding_quantize is not None
+            and embedding_quantize.startswith("torchao:")
+        ):
+            raise ValueError(
+                "Shared embedding is only supported with torchao quantization."
+            )
+
+    if multimethod_enabled:
+        if lora_config is not None:
+            raise ValueError(
+                "Cannot use both base.lora_config and multimethod.methods. "
+                "Use multimethod.methods for all LoRA variants."
+            )
+        if pt2e_quantize is not None:
+            raise ValueError(
+                "PT2E quantization is not supported with multimethod export."
+            )
+
+
+def get_quantizer_and_quant_params_from_args(
+    *,
+    pt2e_quantize=None,
+    qmode=None,
+    so_library: Optional[str] = None,
+    backend_vulkan_enabled: bool = False,
+):
+    pt2e_quantize = _enum_value(pt2e_quantize)
+    pt2e_quant_params = get_pt2e_quantization_params(pt2e_quantize, qmode)
+    quantizers = get_pt2e_quantizers(pt2e_quant_params, so_library)
+    quant_dtype = None
+    if backend_vulkan_enabled and pt2e_quantize:
+        assert (
+            len(quantizers) == 0
+        ), "Should not enable both vulkan and other quantizers"
+        vulkan_quantizer = get_vulkan_quantizer(pt2e_quantize)
+        quantizers.append(vulkan_quantizer)
+    logging.info(f"Applying quantizers: {quantizers}")
+    return pt2e_quant_params, quantizers, quant_dtype
+
+
+def _resolve_llama_model_factory(modelname: str):
+    if modelname in EXECUTORCH_DEFINED_MODELS:
+        return "llama", "Llama2Model"
+    if modelname in TORCHTUNE_DEFINED_MODELS:
+        if modelname == "llama3_2_vision":
+            return "llama3_2_vision", "Llama3_2Decoder"
+        raise ValueError(f"{modelname} is not a valid Llama model.")
+    raise ValueError(f"{modelname} is not a valid Llama model.")
+
+
+def _load_llama_model_from_args(
+    *,
+    modelname: str,
+    checkpoint: Optional[str] = None,
+    params: Optional[str] = None,
+    lora_config=None,
+    use_kv_cache: bool = False,
+    use_sdpa_with_kv_cache: bool = False,
+    generate_full_logits: bool = False,
+    enable_dynamic_shape: bool = True,
+    input_prune_map: Optional[str] = None,
+    output_prune_map: Optional[str] = None,
+    max_seq_length: int = 128,
+    max_context_length: int = 128,
+    verbose: bool = False,
+    use_spin_quant=None,
+    use_qat: bool = False,
+    use_lora: int = 0,
+    use_attention_sink: Optional[str] = None,
+    preq_mode=None,
+    preq_group_size: int = 32,
+    dtype_override: str = "fp32",
+    preq_embedding_quantize: str = "8,0",
+    calibration_tasks=None,
+    calibration_limit=None,
+    calibration_seq_length=None,
+    calibration_data: str = "Once upon a time",
+    tokenizer_path: Optional[str] = None,
+    save_exported_program: bool = False,
+    metadata: Optional[str] = None,
+) -> "LLMEdgeManager":
+    modelname = _enum_value(modelname)
+    dtype_override = _enum_value(dtype_override)
+    use_spin_quant = _enum_value(use_spin_quant)
+    preq_mode = _enum_value(preq_mode)
+    module_name, model_class_name = _resolve_llama_model_factory(modelname)
+
+    (
+        model,
+        example_inputs,
+        example_kwarg_inputs,
+        dynamic_shapes,
+    ) = EagerModelFactory.create_model(
+        module_name,
+        model_class_name,
+        model_class=modelname,
+        checkpoint=checkpoint,
+        params=params,
+        lora_config=lora_config,
+        use_kv_cache=use_kv_cache,
+        use_sdpa_with_kv_cache=use_sdpa_with_kv_cache,
+        generate_full_logits=generate_full_logits,
+        enable_dynamic_shape=enable_dynamic_shape,
+        input_prune_map=input_prune_map,
+        output_prune_map=output_prune_map,
+        max_seq_length=max_seq_length,
+        max_context_length=max_context_length,
+        verbose=verbose,
+        use_spin_quant=use_spin_quant,
+        use_qat=use_qat,
+        use_lora=use_lora,
+        use_attention_sink=use_attention_sink,
+        preq_mode=preq_mode,
+        preq_group_size=preq_group_size,
+        dtype_override=dtype_override,
+        preq_embedding_quantize=preq_embedding_quantize,
+    )
+    dtype_override = DType[dtype_override]
+
+    return LLMEdgeManager(
+        model=model,
+        modelname=modelname,
+        max_seq_len=model.max_seq_len,  # type: ignore
+        dtype=dtype_override,
+        use_kv_cache=use_kv_cache,
+        generate_full_logits=generate_full_logits,
+        example_inputs=example_inputs,
+        example_kwarg_inputs=example_kwarg_inputs,
+        dynamic_shapes=dynamic_shapes,
+        enable_dynamic_shape=enable_dynamic_shape,
+        calibration_tasks=calibration_tasks,
+        calibration_limit=calibration_limit,
+        calibration_seq_length=calibration_seq_length,
+        calibration_data=calibration_data,
+        tokenizer_path=tokenizer_path,
+        save_exported_program=save_exported_program,
+        verbose=verbose,
+        metadata=_load_llama_model_metadata(
+            use_kv_cache,
+            use_sdpa_with_kv_cache,
+            enable_dynamic_shape,
+            model.max_seq_len,
+            model.max_context_len,
+            model.n_layers,
+            model.vocab_size,
+            metadata,
+            num_kv_shared_layers=getattr(model, "num_kv_shared_layers", 0),
+        ),
+    )
+
+
 def _prepare_for_llama_export(llm_config: LlmConfig) -> LLMEdgeManager:
     """
     Helper function for export_llama. Loads the model from checkpoint and params,
@@ -577,7 +761,6 @@ def _prepare_for_llama_export(llm_config: LlmConfig) -> LLMEdgeManager:
 
     Returns a LLMEdgeManager prior to calling export_to_edge with quantizers
     """
-    # load model from checkpoint and params.json
     checkpoint_path = (
         canonical_path(llm_config.base.checkpoint)
         if llm_config.base.checkpoint
@@ -592,45 +775,65 @@ def _prepare_for_llama_export(llm_config: LlmConfig) -> LLMEdgeManager:
     llm_config.base.params = params_path
     llm_config.export.output_dir = output_dir_path
 
-    # Convert dtype override string to actual type.
-    dtype_override = DType[llm_config.model.dtype_override.value]
+    dtype_override = llm_config.model.dtype_override.value
+    use_spin_quant = llm_config.quantization.use_spin_quant
+    preq_mode = llm_config.base.preq_mode
 
-    edge_manager = _load_llama_model(llm_config)
+    edge_manager = _load_llama_model_from_args(
+        modelname=llm_config.base.model_class.value,
+        checkpoint=checkpoint_path,
+        params=params_path,
+        lora_config=llm_config.base.lora_config,
+        use_kv_cache=llm_config.model.use_kv_cache,
+        use_sdpa_with_kv_cache=llm_config.model.use_sdpa_with_kv_cache,
+        generate_full_logits=llm_config.debug.generate_full_logits,
+        enable_dynamic_shape=llm_config.model.enable_dynamic_shape,
+        input_prune_map=llm_config.model.input_prune_map,
+        output_prune_map=llm_config.model.output_prune_map,
+        max_seq_length=llm_config.export.max_seq_length,
+        max_context_length=llm_config.export.max_context_length,
+        verbose=llm_config.debug.verbose,
+        use_spin_quant=use_spin_quant,
+        use_qat=llm_config.quantization.use_qat,
+        use_lora=llm_config.base.use_lora,
+        use_attention_sink=llm_config.model.use_attention_sink,
+        preq_mode=preq_mode,
+        preq_group_size=llm_config.base.preq_group_size,
+        dtype_override=dtype_override,
+        preq_embedding_quantize=llm_config.base.preq_embedding_quantize,
+        calibration_tasks=llm_config.quantization.calibration_tasks,
+        calibration_limit=llm_config.quantization.calibration_limit,
+        calibration_seq_length=llm_config.quantization.calibration_seq_length,
+        calibration_data=llm_config.quantization.calibration_data,
+        save_exported_program=llm_config.export.export_only,
+        metadata=llm_config.base.metadata,
+    )
 
-    # At this point, the model is loaded in the default fp32.
-
-    # Checkpoint dtype should be lower or equal precision to the dtype override.
+    dtype_override_enum = DType[dtype_override]
     checkpoint_dtype = edge_manager.model.checkpoint_dtype
     if not (
-        checkpoint_dtype == dtype_override.to_torch_dtype()
+        checkpoint_dtype == dtype_override_enum.to_torch_dtype()
         or (
             checkpoint_dtype == torch.float16
-            and dtype_override.to_torch_dtype() == torch.float32
+            and dtype_override_enum.to_torch_dtype() == torch.float32
         )
         or (
             checkpoint_dtype == torch.bfloat16
-            and dtype_override.to_torch_dtype() == torch.float32
+            and dtype_override_enum.to_torch_dtype() == torch.float32
         )
     ):
         logging.warning(
-            f"Checkpoint dtype {checkpoint_dtype} precision is higher than dtype override {dtype_override.to_torch_dtype()}."
+            f"Checkpoint dtype {checkpoint_dtype} precision is higher than dtype override {dtype_override_enum.to_torch_dtype()}."
         )
 
-    # Quantize weights in checkpoint dtype for accuracy, then cast to
-    # dtype_override afterward. IntxUnpackedToInt8Tensor.to() properly
-    # propagates the dtype change to scale/zero_point/output dtype.
     logging.info(f"Checkpoint dtype: {edge_manager.model.checkpoint_dtype}")
     edge_manager = edge_manager.set_output_dir(output_dir_path).source_transform(
         _get_source_transforms(
-            dtype_override=dtype_override,
-            checkpoint=llm_config.base.checkpoint,
+            dtype_override=dtype_override_enum,
+            checkpoint=checkpoint_path,
             checkpoint_dtype=DType.from_torch_dtype(checkpoint_dtype),  # type: ignore
             tokenizer_path=llm_config.base.tokenizer_path,
-            use_spin_quant=(
-                llm_config.quantization.use_spin_quant.value
-                if llm_config.quantization.use_spin_quant
-                else None
-            ),
+            use_spin_quant=_enum_value(use_spin_quant),
             embedding_quantize=llm_config.quantization.embedding_quantize,
             use_shared_embedding=llm_config.model.use_shared_embedding,
             quantization_mode=llm_config.quantization.qmode,
@@ -647,9 +850,7 @@ def _prepare_for_llama_export(llm_config: LlmConfig) -> LLMEdgeManager:
             use_kv_cache=llm_config.model.use_kv_cache,
             use_qat=llm_config.quantization.use_qat,
             use_lora=llm_config.base.use_lora,
-            preq_mode=(
-                llm_config.base.preq_mode.value if llm_config.base.preq_mode else None
-            ),
+            preq_mode=_enum_value(preq_mode),
             preq_group_size=llm_config.base.preq_group_size,
             preq_embedding_quantize=llm_config.base.preq_embedding_quantize,
             local_global_attention=llm_config.model.local_global_attention,
@@ -659,34 +860,19 @@ def _prepare_for_llama_export(llm_config: LlmConfig) -> LLMEdgeManager:
         )
     )
 
-    # Now cast to the dtype override after quantization, so non-quantized
-    # components use the desired computation dtype.
-    edge_manager.model = edge_manager.model.to(dtype=dtype_override.to_torch_dtype())
-
+    edge_manager.model = edge_manager.model.to(
+        dtype=dtype_override_enum.to_torch_dtype()
+    )
     return edge_manager
 
 
 def get_quantizer_and_quant_params(llm_config):
-    pt2e_quant_params = get_pt2e_quantization_params(
-        (
-            llm_config.quantization.pt2e_quantize.value
-            if llm_config.quantization.pt2e_quantize
-            else None
-        ),
-        llm_config.quantization.qmode,
+    return get_quantizer_and_quant_params_from_args(
+        pt2e_quantize=llm_config.quantization.pt2e_quantize,
+        qmode=llm_config.quantization.qmode,
+        so_library=llm_config.export.so_library,
+        backend_vulkan_enabled=llm_config.backend.vulkan.enabled,
     )
-    quantizers = get_pt2e_quantizers(pt2e_quant_params, llm_config.export.so_library)
-    quant_dtype = None
-    if llm_config.backend.vulkan.enabled and llm_config.quantization.pt2e_quantize:
-        assert (
-            len(quantizers) == 0
-        ), "Should not enable both vulkan and other quantizers"
-        vulkan_quantizer = get_vulkan_quantizer(
-            llm_config.quantization.pt2e_quantize.value
-        )
-        quantizers.append(vulkan_quantizer)
-    logging.info(f"Applying quantizers: {quantizers}")
-    return pt2e_quant_params, quantizers, quant_dtype
 
 
 def _qmode_type(value):
@@ -707,47 +893,21 @@ def _qmode_type(value):
 
 
 def _validate_args(llm_config):
-    if llm_config.export.max_context_length < llm_config.export.max_seq_length:
-        raise ValueError(
-            f"max_context_length {llm_config.export.max_context_length} must be >= max_seq_len {llm_config.export.max_seq_length}. max_context_length impacts kv cache size that is used to remember history, while max_seq_length refers to user prompt length. Please use --max_context_length to specify context length."
-        )
-    if not llm_config.backend.vulkan.enabled:
-        raise ValueError(
-            "This branch only supports Vulkan export. Set backend.vulkan.enabled=true."
-        )
-
-    non_vulkan_enabled = []
+    enabled_backends = []
     for name, cfg in vars(llm_config.backend).items():
-        if name == "vulkan":
-            continue
         if hasattr(cfg, "enabled") and getattr(cfg, "enabled"):
-            non_vulkan_enabled.append(name)
+            enabled_backends.append(name)
 
-    if non_vulkan_enabled:
-        raise ValueError(
-            "Only Vulkan backend is supported in this branch. "
-            f"Disable: {', '.join(non_vulkan_enabled)}"
-        )
-
-    if llm_config.model.use_shared_embedding:
-        if not (
-            llm_config.quantization.embedding_quantize is not None
-            and llm_config.quantization.embedding_quantize.startswith("torchao:")
-        ):
-            raise ValueError(
-                "Shared embedding is only supported with torchao quantization."
-            )
-
-    if llm_config.multimethod.enabled:
-        if llm_config.base.lora_config is not None:
-            raise ValueError(
-                "Cannot use both base.lora_config and multimethod.methods. "
-                "Use multimethod.methods for all LoRA variants."
-            )
-        if llm_config.quantization.pt2e_quantize is not None:
-            raise ValueError(
-                "PT2E quantization is not supported with multimethod export."
-            )
+    validate_vulkan_export_args(
+        max_seq_length=llm_config.export.max_seq_length,
+        max_context_length=llm_config.export.max_context_length,
+        enabled_backends=enabled_backends,
+        use_shared_embedding=llm_config.model.use_shared_embedding,
+        embedding_quantize=llm_config.quantization.embedding_quantize,
+        multimethod_enabled=llm_config.multimethod.enabled,
+        lora_config=llm_config.base.lora_config,
+        pt2e_quantize=llm_config.quantization.pt2e_quantize,
+    )
 
 
 def _to_edge_and_lower_llama(
@@ -819,21 +979,29 @@ def _get_multimethod_partitioners(llm_config: LlmConfig) -> Optional[List[Partit
     ]
 
 
+def get_output_filename_from_args(
+    *, output_name: Optional[str], modelname: str, output_dir: str, dtype: DType
+) -> str:
+    if dtype == DType.fp16:
+        modelname = f"{modelname}_h"
+
+    if output_name:
+        if output_name.endswith(".pte"):
+            return output_name
+        return f"{output_dir}/{output_name}.pte"
+    return f"{output_dir}/{modelname}.pte"
+
+
 def _get_output_filename(
     llm_config: LlmConfig, modelname: str, output_dir: str, dtype: DType
 ) -> str:
     """Determine output filename for the .pte file."""
-    if dtype == DType.fp16:
-        modelname = f"{modelname}_h"
-
-    if llm_config.export.output_name:
-        output_name = llm_config.export.output_name
-        if output_name.endswith(".pte"):
-            return output_name
-        else:
-            return f"{output_dir}/{output_name}.pte"
-    else:
-        return f"{output_dir}/{modelname}.pte"
+    return get_output_filename_from_args(
+        output_name=llm_config.export.output_name,
+        modelname=modelname,
+        output_dir=output_dir,
+        dtype=dtype,
+    )
 
 
 def _export_llama_multimethod(llm_config: LlmConfig) -> LLMEdgeManager:
@@ -1007,71 +1175,35 @@ def _load_llama_model(llm_config: LlmConfig) -> "LLMEdgeManager":
         An instance of LLMEdgeManager which contains the eager mode model.
     """
 
-    modelname = llm_config.base.model_class.value
-    if modelname in EXECUTORCH_DEFINED_MODELS:
-        module_name = "llama"
-        model_class_name = "Llama2Model"  # TODO: Change to "LlamaModel" in examples/models/llama/model.py.
-    elif modelname in TORCHTUNE_DEFINED_MODELS:
-        if modelname == "llama3_2_vision":
-            module_name = "llama3_2_vision"
-            model_class_name = "Llama3_2Decoder"
-        else:
-            raise ValueError(f"{modelname} is not a valid Llama model.")
-    else:
-        raise ValueError(f"{modelname} is not a valid Llama model.")
-
-    (
-        model,
-        example_inputs,
-        example_kwarg_inputs,
-        dynamic_shapes,
-    ) = EagerModelFactory.create_model(
-        module_name,
-        model_class_name,
-        llm_config=llm_config,
-    )
-    # Convert dtype override string to actual type.
-    dtype_override = DType[llm_config.model.dtype_override.value]
-
-    return LLMEdgeManager(
-        model=model,
-        modelname=modelname,
-        max_seq_len=model.max_seq_len,  # type: ignore
-        dtype=dtype_override,
+    return _load_llama_model_from_args(
+        modelname=llm_config.base.model_class.value,
+        checkpoint=llm_config.base.checkpoint,
+        params=llm_config.base.params,
+        lora_config=llm_config.base.lora_config,
         use_kv_cache=llm_config.model.use_kv_cache,
+        use_sdpa_with_kv_cache=llm_config.model.use_sdpa_with_kv_cache,
         generate_full_logits=llm_config.debug.generate_full_logits,
-        example_inputs=example_inputs,
-        example_kwarg_inputs=example_kwarg_inputs,
-        dynamic_shapes=dynamic_shapes,
         enable_dynamic_shape=llm_config.model.enable_dynamic_shape,
+        input_prune_map=llm_config.model.input_prune_map,
+        output_prune_map=llm_config.model.output_prune_map,
+        max_seq_length=llm_config.export.max_seq_length,
+        max_context_length=llm_config.export.max_context_length,
+        verbose=llm_config.debug.verbose,
+        use_spin_quant=llm_config.quantization.use_spin_quant,
+        use_qat=llm_config.quantization.use_qat,
+        use_lora=llm_config.base.use_lora,
+        use_attention_sink=llm_config.model.use_attention_sink,
+        preq_mode=llm_config.base.preq_mode,
+        preq_group_size=llm_config.base.preq_group_size,
+        dtype_override=llm_config.model.dtype_override.value,
+        preq_embedding_quantize=llm_config.base.preq_embedding_quantize,
         calibration_tasks=llm_config.quantization.calibration_tasks,
         calibration_limit=llm_config.quantization.calibration_limit,
         calibration_seq_length=llm_config.quantization.calibration_seq_length,
         calibration_data=llm_config.quantization.calibration_data,
         tokenizer_path=llm_config.base.tokenizer_path,
         save_exported_program=llm_config.export.export_only,
-        verbose=llm_config.debug.verbose,
-        metadata=_load_llama_model_metadata(
-            llm_config.model.use_kv_cache,
-            llm_config.model.use_sdpa_with_kv_cache,
-            llm_config.model.enable_dynamic_shape,
-            # pyre-fixme[6]: For 5th argument expected `ModelArgs` but got
-            #  `Union[Tensor, Module]`.
-            model.max_seq_len,
-            # pyre-fixme[6]: For 6th argument expected `ModelArgs` but got
-            #  `Union[Tensor, Module]`.
-            model.max_context_len,
-            # pyre-fixme[6]: For 7th argument expected `int` but got `Union[Tensor,
-            #  Module]`.
-            model.n_layers,
-            # pyre-fixme[6]: For 8th argument expected `int` but got `Union[Tensor,
-            #  Module]`.
-            model.vocab_size,
-            llm_config.base.metadata,
-            # pyre-fixme[6]: For 10th argument expected `int` but got `Union[Tensor,
-            #  Module]`.
-            num_kv_shared_layers=getattr(model, "num_kv_shared_layers", 0),
-        ),
+        metadata=llm_config.base.metadata,
     )
 
 

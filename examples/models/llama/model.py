@@ -25,24 +25,78 @@ from ..model_base import EagerModelBase
 
 
 class Llama2Model(EagerModelBase):
-    def __init__(self, llm_config: Optional[LlmConfig] = None):
-        self.llm_config = llm_config if llm_config else LlmConfig()
+    def __init__(
+        self,
+        llm_config: Optional[LlmConfig] = None,
+        *,
+        model_class="llama3",
+        checkpoint: Optional[str] = None,
+        params: Optional[str] = None,
+        lora_config=None,
+        use_kv_cache: bool = False,
+        use_sdpa_with_kv_cache: bool = False,
+        generate_full_logits: bool = False,
+        enable_dynamic_shape: bool = True,
+        input_prune_map: Optional[str] = None,
+        output_prune_map: Optional[str] = None,
+        max_seq_length: int = 128,
+        max_context_length: int = 128,
+        verbose: bool = False,
+        use_spin_quant=None,
+        use_qat: bool = False,
+        use_lora: int = 0,
+        use_attention_sink: Optional[str] = None,
+        preq_mode=None,
+        preq_group_size: int = 32,
+        dtype_override="fp32",
+        preq_embedding_quantize: str = "8,0",
+    ):
+        def _enum_value(value):
+            return value.value if hasattr(value, "value") else value
 
-        checkpoint_path = self.llm_config.base.checkpoint
-        params_path = self.llm_config.base.params
-
-        # LoRA adapter configuration.
-        lora_config = self.llm_config.base.lora_config
-
-        self.use_kv_cache = self.llm_config.model.use_kv_cache
-        self.use_sdpa_with_kv_cache_op = self.llm_config.model.use_sdpa_with_kv_cache
-        self.generate_full_logits = self.llm_config.debug.generate_full_logits
-        self.enable_dynamic_shape = self.llm_config.model.enable_dynamic_shape
-        self.input_prune_map_path = self.llm_config.model.input_prune_map
-        self.output_prune_map_path = self.llm_config.model.output_prune_map
-        self.max_seq_len = self.llm_config.export.max_seq_length
-        self.max_context_len = self.llm_config.export.max_context_length
-        self.verbose = self.llm_config.debug.verbose
+        if llm_config is not None:
+            checkpoint_path = llm_config.base.checkpoint
+            params_path = llm_config.base.params
+            lora_config = llm_config.base.lora_config
+            self.model_class = llm_config.base.model_class.value
+            self.use_kv_cache = llm_config.model.use_kv_cache
+            self.use_sdpa_with_kv_cache_op = llm_config.model.use_sdpa_with_kv_cache
+            self.generate_full_logits = llm_config.debug.generate_full_logits
+            self.enable_dynamic_shape = llm_config.model.enable_dynamic_shape
+            self.input_prune_map_path = llm_config.model.input_prune_map
+            self.output_prune_map_path = llm_config.model.output_prune_map
+            self.max_seq_len = llm_config.export.max_seq_length
+            self.max_context_len = llm_config.export.max_context_length
+            self.verbose = llm_config.debug.verbose
+            self.use_spin_quant = _enum_value(llm_config.quantization.use_spin_quant)
+            self.use_qat = llm_config.quantization.use_qat
+            self.use_lora_rank = llm_config.base.use_lora
+            self.use_attention_sink = llm_config.model.use_attention_sink
+            self.preq_mode = _enum_value(llm_config.base.preq_mode)
+            self.preq_group_size = llm_config.base.preq_group_size
+            self.dtype_override = _enum_value(llm_config.model.dtype_override)
+            self.preq_embedding_quantize = llm_config.base.preq_embedding_quantize
+        else:
+            checkpoint_path = checkpoint
+            params_path = params
+            self.model_class = _enum_value(model_class)
+            self.use_kv_cache = use_kv_cache
+            self.use_sdpa_with_kv_cache_op = use_sdpa_with_kv_cache
+            self.generate_full_logits = generate_full_logits
+            self.enable_dynamic_shape = enable_dynamic_shape
+            self.input_prune_map_path = input_prune_map
+            self.output_prune_map_path = output_prune_map
+            self.max_seq_len = max_seq_length
+            self.max_context_len = max_context_length
+            self.verbose = verbose
+            self.use_spin_quant = _enum_value(use_spin_quant)
+            self.use_qat = use_qat
+            self.use_lora_rank = use_lora
+            self.use_attention_sink = use_attention_sink
+            self.preq_mode = _enum_value(preq_mode)
+            self.preq_group_size = preq_group_size
+            self.dtype_override = _enum_value(dtype_override)
+            self.preq_embedding_quantize = preq_embedding_quantize
 
         assert (
             self.max_context_len >= self.max_seq_len
@@ -129,7 +183,7 @@ class Llama2Model(EagerModelBase):
 
         if model_args.use_scaled_rope:
             # Older models don't have use_scaled_rope configuration
-            model_name = self.llm_config.base.model_class.value
+            model_name = self.model_class
             assert model_name not in ["llama2", "stories110m"]
 
             # Llama3_2 and newer models in ExecuTorch repo should set larger scale factor
@@ -168,7 +222,7 @@ class Llama2Model(EagerModelBase):
             self.model_ = Int8DynActInt4WeightQuantizer()._convert_for_runtime(
                 self.model_
             )
-        elif self.llm_config.quantization.use_spin_quant:
+        elif self.use_spin_quant:
             print("Using SPIN quantization.")
             self._transform_for_pre_quantization(checkpoint, model_args)
 
@@ -177,11 +231,11 @@ class Llama2Model(EagerModelBase):
             )
 
             sanitize_checkpoint_from_pre_quantization(checkpoint)
-        elif self.llm_config.quantization.use_qat:
+        elif self.use_qat:
             print("Using QAT quantization.")
             self._transform_for_pre_quantization(checkpoint, model_args)
-            if self.llm_config.base.use_lora:
-                lora_rank = self.llm_config.base.use_lora
+            if self.use_lora_rank:
+                lora_rank = self.use_lora_rank
                 assert model_args.lora_args["rank"] == lora_rank
                 from .source_transformation.lora import (
                     transform_linear_for_lora_after_quantization,
@@ -199,10 +253,10 @@ class Llama2Model(EagerModelBase):
 
             sanitize_checkpoint_from_pre_quantization(checkpoint)
 
-        if self.llm_config.model.use_attention_sink:
+        if self.use_attention_sink:
             from .source_transformation.attention_sink import enable_attention_sink
 
-            attention_sink_params = self.llm_config.model.use_attention_sink.split(",")
+            attention_sink_params = self.use_attention_sink.split(",")
             assert len(attention_sink_params) == 2, (
                 f"use_attention_sink expects exactly 2 comma-separated values "
                 f"(sink_size,window_size), got {len(attention_sink_params)}"
@@ -213,10 +267,8 @@ class Llama2Model(EagerModelBase):
             # max_context_length must be >= sink_size + window_size to have enough RoPE frequencies
             # A larger max_context_length is allowed (and recommended) to support generation beyond
             # the sliding window size.
-            assert (
-                self.llm_config.export.max_context_length >= sink_size + window_size
-            ), (
-                f"max_context_length ({self.llm_config.export.max_context_length}) must be >= "
+            assert self.max_context_len >= sink_size + window_size, (
+                f"max_context_length ({self.max_context_len}) must be >= "
                 f"sink_size + window_size ({sink_size + window_size})"
             )
 
@@ -311,21 +363,20 @@ class Llama2Model(EagerModelBase):
             )
 
     def _transform_for_pre_quantization(self, checkpoint, model_args):
-        assert self.llm_config.base.preq_mode, "preq_mode must be specified"
-        assert self.llm_config.base.preq_mode.value in [
+        assert self.preq_mode, "preq_mode must be specified"
+        assert self.preq_mode in [
             "8da4w",
             "8da4w_output_8da8w",
-        ], f"Quantization mode {self.llm_config.base.preq_mode.value} is not compatible with SpinQuant."
-        assert self.llm_config.base.preq_group_size, "preq_group_size must be specified"
-        assert self.llm_config.model.dtype_override, "dtype_override must be specified"
+        ], f"Quantization mode {self.preq_mode} is not compatible with SpinQuant."
+        assert self.preq_group_size, "preq_group_size must be specified"
+        assert self.dtype_override, "dtype_override must be specified"
 
         from .source_transformation.pre_quantization import (
             transform_linear_for_pre_quantization,
         )
 
         assert (
-            self.llm_config.base.preq_group_size
-            == model_args.quantization_args["group_size"]
+            self.preq_group_size == model_args.quantization_args["group_size"]
         )
 
         mapping = {
@@ -335,7 +386,7 @@ class Llama2Model(EagerModelBase):
         }
 
         # Transform the output layer first if needed.
-        if self.llm_config.base.preq_mode.value == "8da4w_output_8da8w":
+        if self.preq_mode == "8da4w_output_8da8w":
             from .source_transformation.pre_quantization import (
                 transform_output_linear_for_pre_quantization,
             )
@@ -343,22 +394,22 @@ class Llama2Model(EagerModelBase):
             self.model_ = transform_output_linear_for_pre_quantization(
                 module=self.model_,
                 checkpoint=checkpoint,
-                dtype=mapping[self.llm_config.model.dtype_override.value],
+                dtype=mapping[self.dtype_override],
             )
 
         self.model_ = transform_linear_for_pre_quantization(
             self.model_,
             checkpoint,
-            self.llm_config.base.preq_group_size,
-            mapping[self.llm_config.model.dtype_override.value],
+            self.preq_group_size,
+            mapping[self.dtype_override],
         )
 
         embedding_bit_width, embedding_group_size = None, None
-        if self.llm_config.base.preq_embedding_quantize:
+        if self.preq_embedding_quantize:
             (
                 embedding_bit_width,
                 embedding_group_size,
-            ) = self.llm_config.base.preq_embedding_quantize.split(",")
+            ) = self.preq_embedding_quantize.split(",")
             from .source_transformation.pre_quantization import (
                 transform_embedding_for_pre_quantization,
             )
@@ -375,7 +426,7 @@ class Llama2Model(EagerModelBase):
             self.model_ = transform_embedding_for_pre_quantization(
                 self.model_,
                 checkpoint,
-                mapping[self.llm_config.model.dtype_override.value],
+                mapping[self.dtype_override],
                 int(embedding_bit_width),
                 embedding_group_size,
             )

@@ -3,25 +3,147 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from executorch.examples.models.llama.export_llama_lib import export_llama
-from executorch.extension.llm.export.config.llm_config import DtypeOverride, LlmConfig, ModelType
+from executorch.examples.models.gemma3 import Gemma3Model, convert_weights
+from executorch.examples.models.llama.export_llama_lib import (
+    _to_edge_and_lower_llama,
+    canonical_path,
+    get_output_filename_from_args,
+)
+from executorch.examples.models.llama.hf_download import (
+    download_and_convert_hf_checkpoint,
+)
+from executorch.examples.models.llama.source_transformation.custom_kv_cache import (
+    replace_kv_cache_with_custom_kv_cache,
+)
+from executorch.examples.models.llama.source_transformation.sdpa import (
+    replace_sdpa_with_custom_op,
+)
+from executorch.extension.llm.export.builder import DType, LLMEdgeManager
+
+ENABLE_DYNAMIC_SHAPE = True
+VULKAN_FORCE_FP16 = True
 
 
-def build_config(args: argparse.Namespace) -> LlmConfig:
-    cfg = LlmConfig()
-    cfg.base.model_class = ModelType.gemma3_1b
-    cfg.base.params = str(Path(args.params).expanduser().resolve())
-    if args.checkpoint:
-        cfg.base.checkpoint = str(Path(args.checkpoint).expanduser().resolve())
-    cfg.model.enable_dynamic_shape = args.enable_dynamic_shape
-    cfg.model.use_kv_cache = True
-    cfg.model.use_sdpa_with_kv_cache = True
-    cfg.model.quantize_kv_cache = False
-    cfg.model.dtype_override = DtypeOverride.fp32
-    cfg.backend.vulkan.enabled = True
-    cfg.backend.vulkan.force_fp16 = args.vulkan_force_fp16
-    cfg.export.output_name = str(Path(args.output).expanduser().resolve())
-    return cfg
+def _resolve_checkpoint(checkpoint: str | None) -> str:
+    if checkpoint:
+        return str(Path(checkpoint).expanduser().resolve())
+    return download_and_convert_hf_checkpoint(
+        "google/gemma-3-1b-it",
+        convert_weights,
+    )
+
+
+def _build_edge_manager(
+    *,
+    checkpoint_path: str,
+    params_path: str,
+    dtype_override: DType,
+) -> LLMEdgeManager:
+    model_wrapper = Gemma3Model(
+        model_class="gemma3_1b",
+        checkpoint=checkpoint_path,
+        params=params_path,
+        use_kv_cache=True,
+        use_sdpa_with_kv_cache=True,
+        enable_dynamic_shape=ENABLE_DYNAMIC_SHAPE,
+        max_seq_length=128,
+        max_context_length=128,
+        dtype_override=dtype_override.value,
+    )
+    model = model_wrapper.get_eager_model()
+    metadata = {
+        "get_max_seq_len": model.max_seq_len,
+        "get_max_context_len": model.max_context_len,
+        "get_n_layers": model.n_layers,
+        "get_vocab_size": model.vocab_size,
+        "use_kv_cache": True,
+        "use_sdpa_with_kv_cache": True,
+        "enable_dynamic_shape": ENABLE_DYNAMIC_SHAPE,
+    }
+    if getattr(model, "num_kv_shared_layers", 0) > 0:
+        metadata["get_num_kv_shared_layers"] = model.num_kv_shared_layers
+
+    return LLMEdgeManager(
+        model=model,
+        modelname="gemma3_1b",
+        max_seq_len=model.max_seq_len,
+        dtype=dtype_override,
+        use_kv_cache=True,
+        generate_full_logits=False,
+        example_inputs=model_wrapper.get_example_inputs(),
+        example_kwarg_inputs=None,
+        dynamic_shapes=None,
+        enable_dynamic_shape=ENABLE_DYNAMIC_SHAPE,
+        calibration_tasks=None,
+        calibration_limit=None,
+        calibration_seq_length=None,
+        calibration_data="Once upon a time",
+        tokenizer_path=None,
+        save_exported_program=False,
+        verbose=False,
+        metadata=metadata,
+    )
+
+
+def _source_transforms():
+    return [
+        replace_kv_cache_with_custom_kv_cache,
+        replace_sdpa_with_custom_op,
+    ]
+
+
+def export_gemma3_1b(
+    *,
+    params: str,
+    checkpoint: str | None,
+    output: str,
+) -> str:
+    resolved_output = str(Path(output).expanduser().resolve())
+    resolved_params = str(Path(params).expanduser().resolve())
+    resolved_checkpoint = _resolve_checkpoint(checkpoint)
+
+    quantizers = []
+
+    checkpoint_path = canonical_path(resolved_checkpoint)
+    params_path = canonical_path(resolved_params)
+    output_dir_path = canonical_path(".", dir=True)
+    dtype_override = DType.fp32
+
+    builder_manager = _build_edge_manager(
+        checkpoint_path=checkpoint_path,
+        params_path=params_path,
+        dtype_override=dtype_override,
+    )
+    builder_manager = builder_manager.set_output_dir(output_dir_path).source_transform(
+        _source_transforms()
+    )
+    builder_manager.model = builder_manager.model.to(
+        dtype=dtype_override.to_torch_dtype()
+    )
+    builder_exported = builder_manager.export()
+    builder_exported.run_canonical_optimizations()
+    modelname = builder_exported.modelname
+
+    builder = _to_edge_and_lower_llama(
+        builder_exported,
+        modelname,
+        [],
+        quantizers,
+        dtype_override=dtype_override.value,
+        enable_dynamic_shape=ENABLE_DYNAMIC_SHAPE,
+        vulkan_force_fp16=VULKAN_FORCE_FP16,
+        generate_etrecord=False,
+        verbose=False,
+    )
+
+    output_file = get_output_filename_from_args(
+        output_name=resolved_output,
+        modelname=modelname,
+        output_dir=builder.output_dir,
+        dtype=builder.dtype,
+    )
+    builder.save_to_pte(output_file)
+    return output_file
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,22 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         default="artifacts/pte/gemma3_1b_vulkan_fp32_test.pte",
     )
-    parser.add_argument(
-        "--enable-dynamic-shape",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--vulkan-force-fp16",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    output = export_llama(build_config(args))
+    output = export_gemma3_1b(
+        params=args.params,
+        checkpoint=args.checkpoint,
+        output=args.output,
+    )
     print(output)
 
 
