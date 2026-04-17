@@ -32,6 +32,7 @@ from executorch.exir.tensor import TensorSpec
 from torch._export.utils import get_buffer, get_param, is_buffer, is_param
 from torch.export import ExportedProgram
 from torch.fx import Node
+from torch.utils import _pytree as pytree
 
 _ScalarType = Union[bool, int, float]
 _Argument = Union[
@@ -377,11 +378,12 @@ class VkGraphBuilder:
             raise RuntimeError(f"Cannot create value for arg of type {type(arg)}")
 
     def process_placeholder_node(self, node: Node) -> None:
-        # ignores any tensors that don't get used in any ops
-        if len(node.users) == 0:
-            return None
+        # Keep placeholder ABI stable even if some placeholders are currently
+        # unused by lowered ops; delegate-call argument ordering depends on it.
         ids = self.create_node_value(node)
-        if not is_param_node(self.program, node):
+        if (not is_param_node(self.program, node)) or is_mutable_buffer_node(
+            node, self.program
+        ):
             if isinstance(ids, int):
                 self.input_ids.append(ids)
             else:
@@ -422,11 +424,20 @@ class VkGraphBuilder:
 
         # Add output node
         operator_call_args.append(self.create_node_value(node))
-        operator_node_id = (
-            0
-            if not self.delegate_mapping_builder
-            else self.delegate_mapping_builder.insert_delegate_mapping_entry(node)
-        )
+        operator_node_id = 0
+        if self.delegate_mapping_builder:
+            debug_handle = node.meta.get("debug_handle")
+            if debug_handle is None:
+                logger.debug(
+                    "Skipping delegate debug mapping for Vulkan internal node %s (%s)",
+                    node.name,
+                    node.target,
+                )
+                operator_node_id = 0xFFFFFFFF
+            else:
+                operator_node_id = self.delegate_mapping_builder.insert_delegate_mapping_entry(
+                    node
+                )
         self.chain.append(
             vk_graph_schema.OperatorCall(
                 node_id=operator_node_id,  # pyre-ignore[6]: this is going to be an int
@@ -439,28 +450,26 @@ class VkGraphBuilder:
         self.create_node_value(node)
 
     def process_output_node(self, node: Node) -> None:
-        for out_node in node.all_input_nodes:
+        for out_node in pytree.tree_flatten(node.args[0])[0]:
+            if not isinstance(out_node, Node):
+                raise AssertionError(
+                    f"Unsupported non-Node output in Vulkan graph serialization: {type(out_node)}"
+                )
             if out_node not in self.node_to_value_ids:
                 raise AssertionError(
                     "Cannot find input to output node in node_to_value_ids. This means "
                     "the output node is being serialized before its corresponding "
                     "internal node which is not allowed."
                 )
-            # Mutable buffers outputs are not included as an output to the
-            # delegate call. Skip marking them as an output.
-            if is_mutable_buffer_node(out_node, self.program):
-                continue
-
             self.output_ids.append(self.node_to_value_ids[out_node])
 
-    def process_node(self, node: Node, call_node_debug_hdl: int) -> None:
+    def process_node(self, node: Node) -> None:
         if node.op == "placeholder":
             self.process_placeholder_node(node)
         elif node.op == "call_function":
             if node.target == operator.getitem:
                 self.process_getitem_node(node)
             else:
-                node.meta["debug_handle"] = call_node_debug_hdl
                 self.process_call_function_node(node)
         elif node.op == "get_attr":
             self.process_getattr_node(node)
@@ -470,10 +479,8 @@ class VkGraphBuilder:
             raise AssertionError(f"Unsupported node op: {node.op}")
 
     def build_graph(self) -> vk_graph_schema.VkGraph:
-        call_node_debug_hdl = 0
         for node in self.program.graph_module.graph.nodes:
-            self.process_node(node, call_node_debug_hdl)
-            call_node_debug_hdl += 1
+            self.process_node(node)
 
         logger.info("Operators included in this Vulkan partition: ")
         for op in self.seen_ops:

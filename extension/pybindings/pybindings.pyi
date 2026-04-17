@@ -7,7 +7,7 @@
 # pyre-strict
 from __future__ import annotations
 
-from typing import Any, Dict, Enum, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Enum, List, Optional, Sequence, Tuple, TypedDict
 
 from executorch.exir._warnings import experimental
 
@@ -22,6 +22,12 @@ class Verification(Enum):
 
     Minimal: ...
     InternalConsistency: ...
+
+class DelegateDebugFocusScope(TypedDict, total=False):
+    instruction_id: int
+    debug_handles: Sequence[int]
+    debug_handle_ranges: Sequence[Tuple[int, int]]
+    debug_names: Sequence[str]
 
 @experimental("This API is experimental and subject to change without notice.")
 class ExecuTorchModule:
@@ -85,9 +91,22 @@ class ExecuTorchProgram:
     def load_method(self, method_name: str) -> ExecuTorchMethod: ...
     def method_meta(self, method_name: str) -> MethodMeta: ...
     def has_etdump(self) -> bool: ...
+    def set_etdump_debug_level(
+        self,
+        level: str,
+    ) -> None: ...
+    def set_delegate_debug_handle_focus(
+        self,
+        debug_handles: Sequence[int] = ...,
+        debug_handle_ranges: Sequence[Tuple[int, int]] = ...,
+        debug_names: Sequence[str] = ...,
+        scoped_debug_handles: Sequence[DelegateDebugFocusScope] = ...,
+    ) -> None: ...
+    def clear_delegate_debug_handle_focus(self) -> None: ...
     def write_etdump_result_to_file(
         self, path: str, debug_buffer_path: Optional[str] = None
     ) -> None: ...
+    def reset_etdump(self) -> None: ...
 
 @experimental("This API is experimental and subject to change without notice.")
 class ExecuTorchMethod:

@@ -7,6 +7,8 @@
 # pyre-unsafe
 
 import sys
+import os
+import tempfile
 import unittest
 from io import StringIO
 
@@ -203,6 +205,63 @@ class PybindingsTest(unittest.TestCase):
 
         expected = model(inputs[0])
         self.assertTrue(torch.allclose(expected, executorch_output))
+
+    def test_rank0_tensor_input(self) -> None:
+        class ModuleMulScalarTensor(torch.nn.Module):
+            def forward(self, x, y):
+                return x * y
+
+        model = ModuleMulScalarTensor().eval()
+        inputs = (torch.randn(4, dtype=torch.float32), torch.tensor(0.5))
+        exported = to_edge(export(model, inputs, strict=True)).to_executorch()
+
+        executorch_module = self.load_fn(exported.buffer)
+        executorch_output = executorch_module.forward(inputs)[0]
+
+        expected = model(*inputs)
+        self.assertTrue(torch.allclose(expected, executorch_output))
+
+    def test_program_delegate_debug_focus_accepts_scoped_rules(self) -> None:
+        exported_program, _ = create_program(ModuleAdd())
+        executorch_program = self.load_prog_fn(
+            exported_program.buffer,
+            enable_etdump=True,
+            debug_buffer_size=int(1e6),
+        )
+        executorch_program.set_delegate_debug_handle_focus(
+            debug_handles=[1, 2],
+            debug_handle_ranges=[(3, 5)],
+            debug_names=["delegate://foo"],
+            scoped_debug_handles=[
+                {
+                    "instruction_id": 7,
+                    "debug_handles": [11],
+                    "debug_handle_ranges": [(12, 14)],
+                    "debug_names": ["delegate://bar"],
+                }
+            ],
+        )
+        executorch_program.clear_delegate_debug_handle_focus()
+
+    def test_program_reset_etdump_keeps_program_state(self) -> None:
+        exported_program, inputs = create_program(ModuleAdd())
+        executorch_program = self.load_prog_fn(
+            exported_program.buffer,
+            enable_etdump=True,
+            debug_buffer_size=int(1e6),
+        )
+        method = executorch_program.load_method("forward")
+        method.set_inputs(inputs)
+        method.execute()
+        executorch_program.reset_etdump()
+        method.set_inputs(inputs)
+        method.execute()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            etdump_path = os.path.join(tmpdir, "trace.etdp")
+            debug_path = os.path.join(tmpdir, "trace.bin")
+            executorch_program.write_etdump_result_to_file(etdump_path, debug_path)
+            self.assertTrue(os.path.exists(etdump_path))
 
     def test_method_meta(self) -> None:
         exported_program, inputs = create_program(ModuleAdd())

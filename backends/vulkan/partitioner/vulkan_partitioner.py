@@ -87,6 +87,39 @@ class VulkanSupportedOperators(OperatorSupportBase):
         self.nn_module_blocklist = nn_module_blocklist
         self.nn_module_allowlist = nn_module_allowlist
 
+    def _target_in_set(self, target: OpKey, op_set: Optional[Set[OpKey]]) -> bool:
+        if op_set is None:
+            return False
+
+        # Exact object/string match first.
+        if target in op_set:
+            return True
+
+        # Also support string-based profiles coming from environment JSON.
+        candidates: Set[str] = set()
+        if isinstance(target, str):
+            candidates.add(target)
+        else:
+            candidates.add(str(target))
+            if hasattr(target, "name"):
+                target_name = target.name()
+                if isinstance(target_name, str):
+                    candidates.add(target_name)
+                    candidates.add(target_name.replace("::", "."))
+            if hasattr(target, "__name__"):
+                target_name = target.__name__  # pyre-ignore
+                if isinstance(target_name, str):
+                    candidates.add(target_name)
+                    candidates.add(utils.format_target_name(target_name))
+                    if "." in target_name and not target_name.startswith("aten."):
+                        candidates.add(f"aten.{target_name}")
+
+        for candidate in candidates:
+            if candidate in op_set:
+                return True
+
+        return False
+
     def op_node_is_compatible(  # noqa: C901: Function is too complex
         self, node: torch.fx.Node, features: Optional[OpFeatures] = None
     ) -> Tuple[bool, str]:
@@ -110,11 +143,11 @@ class VulkanSupportedOperators(OperatorSupportBase):
         if (
             utils.is_torch_op_node(node)
             and (self.operator_allowlist is not None)
-            and (target not in self.operator_allowlist)
+            and (not self._target_in_set(target, self.operator_allowlist))
         ):
             return False, "op is not in allowlist"
 
-        if target in self.operator_blocklist:
+        if self._target_in_set(target, self.operator_blocklist):
             return False, "op is in blocklist"
 
         # Extract the features for the node's operator, if no override was provided
@@ -201,12 +234,33 @@ class VulkanSupportedOperators(OperatorSupportBase):
         return r
 
     def _is_node_supported(self, node: torch.fx.Node) -> bool:  # noqa: C901
+        target = node.target
+        if (
+            node.target == torch.ops.higher_order.auto_functionalized
+            or node.target == torch.ops.higher_order.auto_functionalized_v2
+        ):
+            first_arg = node.args[0]
+            assert isinstance(first_arg, torch._ops.OpOverload)
+            target = first_arg.name()
+
         # Check if tensor node dtype is supported by vulkan
         if utils.is_tensor_node(node) and not utils.io_dtypes_are_supported(node):
             self.log_skip(node, "dtype not supported")
             return False
 
         if node.op == "call_function":
+            # Apply operator allowlist/blocklist before handling fusable nodes.
+            # This ensures operator_allowlist=[] can truly disable Vulkan partitioning.
+            if (self.operator_allowlist is not None) and (
+                not self._target_in_set(target, self.operator_allowlist)
+            ):
+                self.log_skip(node, "op is not in allowlist")
+                return False
+
+            if self._target_in_set(target, self.operator_blocklist):
+                self.log_skip(node, "op is in blocklist")
+                return False
+
             # Apply nn module allowlist and blocklist
             if self.nn_module_allowlist is not None:
                 if not utils.node_comes_from_any_nn_module_in_set(
@@ -225,15 +279,6 @@ class VulkanSupportedOperators(OperatorSupportBase):
             # Check if this node is part of a fusable subgraph
             if node in self.fusable_nodes:
                 return True
-
-        target = node.target
-        if (
-            node.target == torch.ops.higher_order.auto_functionalized
-            or node.target == torch.ops.higher_order.auto_functionalized_v2
-        ):
-            first_arg = node.args[0]
-            assert isinstance(first_arg, torch._ops.OpOverload)
-            target = first_arg.name()
 
         is_linear_permute, target_linear_is_compatible = self.is_linear_permute(node)
         if is_linear_permute and target_linear_is_compatible:

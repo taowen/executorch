@@ -10,6 +10,9 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
+#include <cstdio>
+#include <inttypes.h>
 
 #include <executorch/extension/llm/runner/stats.h>
 #include <executorch/extension/llm/runner/text_decoder_runner.h>
@@ -19,6 +22,13 @@
 namespace executorch {
 namespace extension {
 namespace llm {
+
+namespace {
+inline bool et_should_dump_token_ids() {
+  const char* v = std::getenv("ET_DEBUG_TOKEN_IDS");
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+} // namespace
 
 class ET_EXPERIMENTAL TextTokenGenerator {
  public:
@@ -112,6 +122,13 @@ class ET_EXPERIMENTAL TextTokenGenerator {
       stats_->on_sampling_begin();
       cur_token =
           text_decoder_runner_->logits_to_token(logits_tensor, temperature);
+      if (et_should_dump_token_ids()) {
+        fprintf(
+            stderr,
+            "[et_token] prev=%" PRIu64 " next=%" PRIu64 "\n",
+            prev_token,
+            cur_token);
+      }
       stats_->on_sampling_end();
 
       pos++;

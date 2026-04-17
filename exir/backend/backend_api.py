@@ -6,11 +6,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import json
 import logging
+import os
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import singledispatch
-from typing import Dict, Generator, List, Mapping
+from typing import Any, Dict, Generator, List, Mapping
 
 import torch
 
@@ -38,6 +41,104 @@ from executorch.exir.program._fake_program import (
 )
 from torch._export.utils import is_buffer, is_lifted_tensor_constant, is_param
 from torch.export.exported_program import ExportedProgram, InputSpec, OutputSpec
+
+
+def _get_export_abi_dump_path() -> str | None:
+    path = os.environ.get("ET_EXSHADER_ABI_DUMP_PATH", "").strip()
+    return path or None
+
+
+def _append_export_abi_dump_record(record: Dict[str, Any]) -> None:
+    path = _get_export_abi_dump_path()
+    if path is None:
+        return
+
+    payload = {
+        "source": "export",
+        "ts_unix_ms": int(time.time() * 1000),
+        **record,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+            f.write("\n")
+    except Exception as e:
+        logging.warning("Failed to append ET_EXSHADER_ABI_DUMP_PATH=%s: %s", path, e)
+
+
+def _summarize_fx_arg(arg: Any, max_depth: int = 2) -> Dict[str, Any]:
+    if isinstance(arg, torch.fx.Node):
+        return {
+            "kind": "fx_node",
+            "name": arg.name,
+            "op": arg.op,
+            "target": str(arg.target),
+        }
+
+    if isinstance(arg, (int, float, bool, str)) or arg is None:
+        return {"kind": type(arg).__name__, "value": arg}
+
+    if isinstance(arg, (list, tuple)):
+        if max_depth <= 0:
+            return {"kind": type(arg).__name__, "len": len(arg)}
+        return {
+            "kind": type(arg).__name__,
+            "len": len(arg),
+            "items": [_summarize_fx_arg(x, max_depth=max_depth - 1) for x in arg],
+        }
+
+    if isinstance(arg, dict):
+        if max_depth <= 0:
+            return {"kind": "dict", "len": len(arg)}
+        return {
+            "kind": "dict",
+            "len": len(arg),
+            "items": {
+                str(k): _summarize_fx_arg(v, max_depth=max_depth - 1)
+                for k, v in arg.items()
+            },
+        }
+
+    return {"kind": type(arg).__name__, "repr": repr(arg)}
+
+
+def _summarize_compile_specs(compile_specs: List[CompileSpec]) -> List[Dict[str, Any]]:
+    summary: List[Dict[str, Any]] = []
+    for spec in compile_specs:
+        raw = bytes(spec.value)
+        preview_bytes = raw[:32]
+        preview_ascii = "".join(
+            chr(b) if 32 <= b <= 126 else "." for b in preview_bytes
+        )
+        summary.append(
+            {
+                "key": str(spec.key),
+                "nbytes": len(raw),
+                "preview_hex": preview_bytes.hex(),
+                "preview_ascii": preview_ascii,
+            }
+        )
+    return summary
+
+
+def _summarize_input_spec(spec: InputSpec) -> Dict[str, Any]:
+    arg = spec.arg
+    return {
+        "kind": str(spec.kind),
+        "arg_type": type(arg).__name__,
+        "arg_name": getattr(arg, "name", None),
+        "target": None if spec.target is None else str(spec.target),
+    }
+
+
+def _summarize_output_spec(spec: OutputSpec) -> Dict[str, Any]:
+    arg = spec.arg
+    return {
+        "kind": str(spec.kind),
+        "arg_type": type(arg).__name__,
+        "arg_name": getattr(arg, "name", None),
+        "target": None if spec.target is None else str(spec.target),
+    }
 
 
 @singledispatch
@@ -169,6 +270,8 @@ def _get_node_list_with_same_tag(
     Return a list of nodes with the same tag.
     """
     node_list = []
+    inputs_to_buffers = owning_program.graph_signature.inputs_to_buffers
+    mutated_buffer_targets = set(owning_program.graph_signature.buffers_to_mutate.values())
 
     for node in tagged_graph_module.graph.nodes:
         if node.meta.get("delegation_tag", "") == tag:
@@ -184,6 +287,16 @@ def _get_node_list_with_same_tag(
                         f"placeholder node for non-params, non-buffer, and non-tensor constants should not be tagged: {node} "
                     )
                 else:
+                    is_mutable_buffer = (
+                        node.name in inputs_to_buffers
+                        and inputs_to_buffers[node.name] in mutated_buffer_targets
+                    )
+                    if is_mutable_buffer:
+                        # Mutable buffers must remain outer-graph placeholders so
+                        # delegate call sites can pass them through as live state.
+                        # Do not include them in the owned node list for the
+                        # lowered submodule.
+                        continue
                     # check that the users all belong to the same tag
                     for user in node.users:
                         users_tag = user.meta.get("delegation_tag", None)
@@ -244,6 +357,46 @@ def _insert_lowered_submodule(
         ]
         call_submodule_node.replace_all_uses_with(call_delegate_node)
         owning_graph_module.graph.erase_node(call_submodule_node)
+
+    submodule_input_specs = [
+        _summarize_input_spec(s) for s in submodule_program.graph_signature.input_specs
+    ]
+    submodule_output_specs = [
+        _summarize_output_spec(s) for s in submodule_program.graph_signature.output_specs
+    ]
+    submodule_output_values = (
+        [_summarize_fx_arg(a) for a in submodule_output_node.args[0]]
+        if submodule_output_node.args
+        else []
+    )
+    max_items = 32
+
+    _append_export_abi_dump_record(
+        {
+            "event": "insert_lowered_submodule",
+            "backend_id": lowered_module.backend_id,
+            "is_submodule": is_submodule,
+            "owning_graph_module": str(type(owning_graph_module)),
+            "lowered_module_attr": lowered_name,
+            "call_submodule_node_name": call_submodule_node.name,
+            "call_submodule_target": str(call_submodule_node.target),
+            "call_submodule_args": [
+                _summarize_fx_arg(a) for a in call_submodule_node.args
+            ],
+            "call_delegate_args": [_summarize_fx_arg(a) for a in call_delegate_args],
+            "call_delegate_kwargs": {
+                str(k): _summarize_fx_arg(v)
+                for k, v in call_submodule_node.kwargs.items()
+            },
+            "submodule_input_specs_count": len(submodule_input_specs),
+            "submodule_output_specs_count": len(submodule_output_specs),
+            "submodule_output_node_values_count": len(submodule_output_values),
+            "submodule_input_specs_head": submodule_input_specs[:max_items],
+            "submodule_output_specs_head": submodule_output_specs[:max_items],
+            "submodule_output_node_values_head": submodule_output_values[:max_items],
+            "compile_specs": _summarize_compile_specs(lowered_module.compile_specs),
+        }
+    )
     if is_submodule:
         assert len(toplevel_input_specs_to_delete) == 0
         assert len(toplevel_output_specs_to_delete) == 0

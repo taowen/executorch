@@ -14,28 +14,141 @@
 #include <executorch/backends/vulkan/runtime/api/containers/StagingBuffer.h>
 
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Staging.h>
+#include <executorch/backends/vulkan/runtime/graph/ops/impl/Common.h>
 
+#include <executorch/backends/vulkan/runtime/graph/ops/utils/BindingUtils.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/utils/StagingUtils.h>
+#include <executorch/extension/tensor/tensor_ptr_maker.h>
+
+#include <array>
+#include <mutex>
+#include <unordered_set>
 
 #ifdef ET_EVENT_TRACER_ENABLED
-std::string& set_and_get_current_operator_json(const std::string& json) {
-  static std::string current_operator_json;
-  if (json.size() > 0) {
-    current_operator_json = json;
-  }
-  return current_operator_json;
+namespace {
+
+std::string g_current_operator_json;
+uint32_t g_current_operator_node_id = UINT32_MAX;
+
+} // namespace
+
+void set_current_operator_json(const std::string& json) {
+  g_current_operator_json = json;
 }
 
-size_t get_current_operator_count(const bool increment) {
-  static int count = 0;
-  if (increment) {
-    count++;
-  }
-  return count;
+const std::string& get_current_operator_json() {
+  return g_current_operator_json;
+}
+
+void set_current_operator_node_id(uint32_t node_id) {
+  g_current_operator_node_id = node_id;
+}
+
+uint32_t get_current_operator_node_id() {
+  return g_current_operator_node_id;
 }
 #endif /* ET_EVENT_TRACER_ENABLED */
 
 namespace vkcompute {
+
+#ifdef ET_EVENT_TRACER_ENABLED
+namespace {
+
+bool is_bitw8_shader_name(const std::string& shader_name) {
+  static constexpr const char* kBitw8Prefix =
+      "bitw8_image_to_nchw_nobitw8buffer";
+  return shader_name.rfind(kBitw8Prefix, 0) == 0;
+}
+
+executorch::aten::ScalarType to_et_scalar_type(const vkapi::ScalarType dtype) {
+  switch (dtype) {
+    case vkapi::kFloat:
+      return executorch::aten::ScalarType::Float;
+    case vkapi::kHalf:
+      return executorch::aten::ScalarType::Half;
+    case vkapi::kInt:
+      return executorch::aten::ScalarType::Int;
+    case vkapi::kLong:
+      return executorch::aten::ScalarType::Long;
+    case vkapi::kBool:
+      return executorch::aten::ScalarType::Bool;
+    case vkapi::kByte:
+      return executorch::aten::ScalarType::Byte;
+    case vkapi::kChar:
+      return executorch::aten::ScalarType::Char;
+    case vkapi::kDouble:
+      return executorch::aten::ScalarType::Double;
+    default:
+      VK_THROW("Unsupported dtype for delegate debug capture: ", dtype);
+  }
+}
+
+std::vector<executorch::aten::SizesType> to_et_sizes(
+    const std::vector<int64_t>& sizes) {
+  std::vector<executorch::aten::SizesType> converted;
+  converted.reserve(sizes.size());
+  for (const int64_t dim : sizes) {
+    converted.push_back(static_cast<executorch::aten::SizesType>(dim));
+  }
+  return converted;
+}
+
+template <typename T>
+executorch::extension::TensorPtr make_tensor_from_staging(
+    ComputeGraph* graph,
+    const ValueRef tensor_ref,
+    const ValueRef staging_ref,
+    const vkapi::ScalarType dtype) {
+  auto data = std::make_shared<std::vector<T>>(graph->numel_of(tensor_ref));
+  graph->maybe_cast_and_copy_from_staging(
+      staging_ref, data->data(), data->size(), dtype);
+  return executorch::extension::for_blob(
+             data->data(),
+             to_et_sizes(graph->sizes_of(tensor_ref)),
+             to_et_scalar_type(dtype))
+      .dynamism(executorch::aten::TensorShapeDynamism::STATIC)
+      .deleter([data = std::move(data)](void*) mutable { data.reset(); })
+      .make_tensor_ptr();
+}
+
+executorch::extension::TensorPtr capture_tensor_from_staging(
+    ComputeGraph* graph,
+    const ValueRef tensor_ref,
+    const ValueRef staging_ref) {
+  switch (graph->dtype_of(tensor_ref)) {
+    case vkapi::kFloat:
+      return make_tensor_from_staging<float>(
+          graph, tensor_ref, staging_ref, vkapi::kFloat);
+    case vkapi::kHalf:
+      return make_tensor_from_staging<uint16_t>(
+          graph, tensor_ref, staging_ref, vkapi::kHalf);
+    case vkapi::kInt:
+      return make_tensor_from_staging<int32_t>(
+          graph, tensor_ref, staging_ref, vkapi::kInt);
+    case vkapi::kLong:
+      return make_tensor_from_staging<int64_t>(
+          graph, tensor_ref, staging_ref, vkapi::kLong);
+    case vkapi::kBool:
+      return make_tensor_from_staging<uint8_t>(
+          graph, tensor_ref, staging_ref, vkapi::kBool);
+    case vkapi::kByte:
+      return make_tensor_from_staging<uint8_t>(
+          graph, tensor_ref, staging_ref, vkapi::kByte);
+    case vkapi::kChar:
+      return make_tensor_from_staging<int8_t>(
+          graph, tensor_ref, staging_ref, vkapi::kChar);
+    case vkapi::kDouble:
+      return make_tensor_from_staging<double>(
+          graph, tensor_ref, staging_ref, vkapi::kDouble);
+    default:
+      VK_THROW(
+          "Unsupported tensor dtype for delegate debug capture: ",
+          graph->dtype_of(tensor_ref));
+  }
+}
+
+} // namespace
+#endif
 
 //
 // VTensorPtr
@@ -1185,6 +1298,214 @@ void ComputeGraph::optional_warmup_execute() {
     execute();
   }
 }
+
+#ifdef ET_EVENT_TRACER_ENABLED
+void ComputeGraph::execute_with_delegate_debug_capture(
+    executorch::runtime::EventTracer* event_tracer) {
+  if (event_tracer == nullptr) {
+    execute();
+    return;
+  }
+
+  auto get_or_create_delegate_debug_staging =
+      [this](const ValueRef tensor_ref) -> ValueRef {
+    const auto it = delegate_debug_staging_cache_.find(tensor_ref);
+    if (it != delegate_debug_staging_cache_.end()) {
+      return it->second;
+    }
+
+    size_t staging_numel = 0;
+    {
+      vTensorPtr tensor = get_tensor(tensor_ref);
+      staging_numel = tensor->staging_buffer_numel();
+    }
+
+    const ValueRef staging_ref = add_staging(
+        get_staging_dtype_for(tensor_ref),
+        staging_numel,
+        vkapi::CopyDirection::DEVICE_TO_HOST);
+    delegate_debug_staging_cache_.insert({tensor_ref, staging_ref});
+    return staging_ref;
+  };
+
+  auto encode_debug_tensor_to_staging_copy =
+      [this](const ValueRef tensor_ref, const ValueRef staging_ref) {
+        if (dtype_of(tensor_ref) == vkapi::kInt8x4) {
+          add_tensor_to_staging_node(*this, tensor_ref, staging_ref);
+          return;
+        }
+
+        const vkapi::ShaderInfo shader = get_tensor_to_nchw_shader(
+            *this,
+            tensor_ref,
+            dtype_of(staging_ref),
+            int8_buffers_enabled());
+
+        vkapi::ParamsBindList param_buffers = {};
+        if (is_buffer_storage(tensor_ref)) {
+          param_buffers.append(buffer_meta_ubo(tensor_ref));
+        } else if (!is_bitw8_shader_name(shader.kernel_name)) {
+          param_buffers.append(texture_meta_ubo(tensor_ref));
+        }
+
+        std::vector<PushConstantDataInfo> push_constants;
+        if (is_bitw8_shader_name(shader.kernel_name)) {
+          push_constants.push_back(sizes_pc_of(tensor_ref));
+          push_constants.push_back(numel_pc_of(tensor_ref));
+        }
+
+        const std::vector<ArgGroup> args = {
+            {staging_ref, vkapi::kWrite},
+            {tensor_ref, vkapi::kRead},
+        };
+        vkapi::SpecVarList spec_vars = {hashed_layout_of(tensor_ref)};
+        utils::uvec3 global_wg_size = create_global_wg_size(tensor_ref);
+        if (is_bitw8_shader_name(shader.kernel_name)) {
+          const uint32_t buffer_len = utils::safe_downcast<uint32_t>(
+              get_staging(staging_ref)->numel() / 4);
+          global_wg_size = {buffer_len, 1, 1};
+        }
+        const utils::uvec3 local_wg_size = default_pick_local_wg_size(
+            this, shader, global_wg_size, args, {});
+
+        std::array<uint8_t, kMaxPushConstantSize> push_constants_data{};
+        uint32_t push_constants_offset = 0;
+        for (const auto& push_constant : push_constants) {
+          push_constants_offset += push_constant.write(
+              push_constants_data.data(),
+              push_constants_offset,
+              kMaxPushConstantSize);
+        }
+
+        api::Context* const context = this->context();
+        std::unique_lock<std::mutex> cmd_lock = context->dispatch_lock();
+        context->set_cmd();
+
+        vkapi::PipelineBarrier pipeline_barrier{};
+        vkapi::DescriptorSet descriptor_set = context->get_descriptor_set(
+            shader,
+            utils::WorkgroupSize(local_wg_size),
+            spec_vars,
+            push_constants_offset);
+        const uint32_t next_binding = bind_values_to_descriptor_set(
+            this, args, pipeline_barrier, descriptor_set, 0);
+        bind_params_to_descriptor_set(param_buffers, descriptor_set, next_binding);
+        context->register_shader_dispatch(
+            descriptor_set,
+            pipeline_barrier,
+            shader,
+            global_wg_size,
+            push_constants_data.data(),
+            push_constants_offset);
+      };
+
+  auto capture_delegate_node_outputs = [this,
+                                        event_tracer,
+                                        &encode_debug_tensor_to_staging_copy,
+                                        &get_or_create_delegate_debug_staging](
+                                           ExecuteNode* node) {
+    if (node->node_id_ == UINT32_MAX) {
+      return;
+    }
+
+    const auto should_capture =
+        event_tracer->should_materialize_delegate_intermediate_output(
+            /* name = */ nullptr,
+            static_cast<executorch::runtime::DelegateDebugIntId>(node->node_id_));
+    if (!should_capture.ok()) {
+      VK_THROW(
+          "Failed to query delegate debug focus for node ",
+          node->node_id_,
+          ": ",
+          static_cast<int>(should_capture.error()));
+    }
+    if (!should_capture.get()) {
+      return;
+    }
+
+    std::vector<ValueRef> output_refs;
+    std::unordered_set<ValueRef> seen_output_refs;
+    for (const ArgGroup& group : node->args_) {
+      if ((group.access & vkapi::MemoryAccessType::WRITE) == 0) {
+        continue;
+      }
+      for (const ValueRef ref : group.refs) {
+        if (!val_is_tensor(ref) || seen_output_refs.count(ref) > 0) {
+          continue;
+        }
+        seen_output_refs.insert(ref);
+        output_refs.push_back(ref);
+      }
+    }
+    if (output_refs.empty()) {
+      return;
+    }
+
+    std::vector<ValueRef> staging_refs;
+    staging_refs.reserve(output_refs.size());
+    for (const ValueRef tensor_ref : output_refs) {
+      const ValueRef staging_ref =
+          get_or_create_delegate_debug_staging(tensor_ref);
+      staging_refs.push_back(staging_ref);
+      encode_debug_tensor_to_staging_copy(tensor_ref, staging_ref);
+    }
+    submit_current_cmd_and_wait();
+    context_->flush();
+
+    std::vector<executorch::extension::TensorPtr> owned_tensors;
+    std::vector<executorch::aten::Tensor> tensors;
+    owned_tensors.reserve(output_refs.size());
+    tensors.reserve(output_refs.size());
+    for (size_t i = 0; i < output_refs.size(); ++i) {
+      auto tensor =
+          capture_tensor_from_staging(this, output_refs[i], staging_refs[i]);
+      owned_tensors.push_back(tensor);
+      tensors.push_back(*tensor);
+    }
+
+    executorch::runtime::Result<bool> log_result = [&]() {
+      if (tensors.size() == 1) {
+        return event_tracer->log_intermediate_output_delegate(
+            /* name = */ nullptr,
+            static_cast<executorch::runtime::DelegateDebugIntId>(
+                node->node_id_),
+            tensors.front());
+      }
+      const executorch::runtime::ArrayRef<executorch::aten::Tensor> tensor_list(
+          tensors.data(), tensors.size());
+      return event_tracer->log_intermediate_output_delegate(
+          /* name = */ nullptr,
+          static_cast<executorch::runtime::DelegateDebugIntId>(node->node_id_),
+          tensor_list);
+    }();
+    if (!log_result.ok()) {
+      VK_THROW(
+          "Failed to log delegate debug output for node ",
+          node->node_id_,
+          ": ",
+          static_cast<int>(log_result.error()));
+    }
+  };
+
+  context_->flush();
+  context_->set_cmd();
+  context_->cmd_reset_querypool();
+  submit_current_cmd_and_wait();
+  context_->flush();
+
+  for (std::unique_ptr<ExecuteNode>& node : execute_nodes_) {
+    context_->set_cmd();
+    node->encode(this);
+    submit_current_cmd_and_wait();
+    context_->flush();
+    capture_delegate_node_outputs(node.get());
+  }
+
+  execute_count_++;
+  updated_values_.clear();
+  requires_reencode_ = false;
+}
+#endif
 
 void ComputeGraph::execute() {
   if (deferred_cmd_list_.empty()) {

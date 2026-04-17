@@ -105,6 +105,20 @@ class EventTracerFilterBase {
       DelegateDebugIntId delegate_debug_index) = 0;
 
   /**
+   * Filters delegated events with access to the enclosing instruction id.
+   *
+   * This default implementation preserves the legacy behavior by ignoring the
+   * instruction id and delegating to `filter(name, delegate_debug_index)`.
+   */
+  virtual Result<bool> filter_delegate(
+      const char* name,
+      DelegateDebugIntId delegate_debug_index,
+      DebugHandle instruction_id) {
+    (void)instruction_id;
+    return filter(name, delegate_debug_index);
+  }
+
+  /**
    * Virtual destructor for the EventTracerFilterBase class.
    * Ensures proper cleanup of derived class objects.
    */
@@ -443,6 +457,26 @@ class EventTracer {
       const double& output) = 0;
 
   /**
+   * Returns whether the caller should spend work materializing a delegate
+   * intermediate output before calling `log_intermediate_output_delegate()`.
+   */
+  virtual Result<bool> should_materialize_delegate_intermediate_output(
+      const char* name,
+      DelegateDebugIntId delegate_debug_index) {
+    (void)name;
+    (void)delegate_debug_index;
+    return false;
+  }
+
+  /**
+   * Returns whether delegate-focused intermediate output capture is configured
+   * at all for the current tracer instance.
+   */
+  virtual bool has_delegate_intermediate_output_focus() const {
+    return false;
+  }
+
+  /**
    * Set the filter of event tracer for delegation intermediate outputs.
    */
   virtual void set_delegation_intermediate_output_filter(
@@ -510,7 +544,7 @@ class EventTracer {
   /**
    * Return the current level of event tracer debug logging.
    */
-  EventTracerDebugLogLevel event_tracer_debug_level() {
+  EventTracerDebugLogLevel event_tracer_debug_level() const {
     return event_tracer_debug_level_;
   }
 

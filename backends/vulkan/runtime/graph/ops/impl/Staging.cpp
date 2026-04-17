@@ -41,6 +41,12 @@ void add_staging_to_tensor_node(
     const ValueRef in_staging,
     const ValueRef out_tensor) {
   VK_CHECK_COND(graph.val_is_staging(in_staging));
+  VK_CHECK_COND(
+      graph.is_buffer_storage(out_tensor) || graph.dim_of(out_tensor) <= 4,
+      "staging->texture path only supports tensors with <= 4 dims; got dim=",
+      graph.dim_of(out_tensor),
+      " for ValueRef ",
+      out_tensor);
 
   if (graph.dtype_of(out_tensor) == vkapi::kInt8x4) {
     return add_staging_to_int8x4_buffer_node(graph, in_staging, out_tensor);
@@ -116,6 +122,12 @@ void add_tensor_to_staging_node(
     const ValueRef in_tensor,
     const ValueRef out_staging) {
   VK_CHECK_COND(graph.val_is_staging(out_staging));
+  VK_CHECK_COND(
+      graph.is_buffer_storage(in_tensor) || graph.dim_of(in_tensor) <= 4,
+      "texture->staging path only supports tensors with <= 4 dims; got dim=",
+      graph.dim_of(in_tensor),
+      " for ValueRef ",
+      in_tensor);
 
   if (graph.dtype_of(in_tensor) == vkapi::kInt8x4) {
     return add_int8x4_buffer_to_staging_node(graph, in_tensor, out_staging);

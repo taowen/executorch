@@ -223,9 +223,18 @@ def _maybe_duplicate_constant_nodes(
     backend can estimate how much they want to duplicate the constant node, either error out or default to duplicate
     """
     candidate_nodes = set()
+    sig = tagged_exported_program.graph_signature
+    inputs_to_buffers = sig.inputs_to_buffers
+    mutated_buffer_targets = set(sig.buffers_to_mutate.values())
     for node in tagged_exported_program.graph.nodes:
         if node.meta.get("delegation_tag", "") == tag:
             if node.op == "placeholder":
+                is_mutable_buffer = (
+                    node.name in inputs_to_buffers
+                    and inputs_to_buffers[node.name] in mutated_buffer_targets
+                )
+                if is_mutable_buffer:
+                    continue
                 for user in node.users:
                     users_tag = user.meta.get("delegation_tag", None)
                     if users_tag != tag:

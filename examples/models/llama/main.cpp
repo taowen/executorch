@@ -8,6 +8,7 @@
  */
 
 #include <executorch/examples/models/llama/runner/runner.h>
+#include <executorch/runtime/core/error.h>
 #include <gflags/gflags.h>
 #include <fstream>
 #include <sstream>
@@ -185,6 +186,7 @@ int32_t main(int32_t argc, char** argv) {
 
   if (runner == nullptr) {
     ET_LOG(Error, "Failed to create llama runner");
+    fprintf(stderr, "llama_main: create_llama_runner returned nullptr\n");
     return 1;
   }
 
@@ -195,6 +197,11 @@ int32_t main(int32_t argc, char** argv) {
         runner->warmup(prompt, /*max_new_tokens=*/warmup_max_new_tokens);
     if (error != executorch::runtime::Error::Ok) {
       ET_LOG(Error, "Failed to warmup llama runner");
+      fprintf(
+          stderr,
+          "llama_main: warmup failed: %s (%u)\n",
+          executorch::runtime::to_string(error),
+          static_cast<unsigned>(error));
       return 1;
     }
   }
@@ -220,6 +227,11 @@ int32_t main(int32_t argc, char** argv) {
   auto error = runner->generate(prompt, config);
   if (error != executorch::runtime::Error::Ok) {
     ET_LOG(Error, "Failed to run llama runner");
+    fprintf(
+        stderr,
+        "llama_main: generate failed: %s (%u)\n",
+        executorch::runtime::to_string(error),
+        static_cast<unsigned>(error));
     return 1;
   }
 

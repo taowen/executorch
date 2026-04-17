@@ -7,14 +7,23 @@
 import unittest
 
 import torch
-from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
-    XnnpackFloatingPointPartitioner,
-)
-from executorch.backends.xnnpack.utils.configs import (
-    get_transform_passes,
-    get_xnnpack_edge_compile_config,
-    get_xnnpack_executorch_backend_config,
-)
+try:
+    from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+        XnnpackFloatingPointPartitioner,
+    )
+    from executorch.backends.xnnpack.utils.configs import (
+        get_transform_passes,
+        get_xnnpack_edge_compile_config,
+        get_xnnpack_executorch_backend_config,
+    )
+
+    HAS_XNNPACK = True
+except ModuleNotFoundError:
+    XnnpackFloatingPointPartitioner = None
+    get_transform_passes = None
+    get_xnnpack_edge_compile_config = None
+    get_xnnpack_executorch_backend_config = None
+    HAS_XNNPACK = False
 
 from executorch.devtools.size_analysis_tool.size_analysis_tool import (
     generate_model_size_information,
@@ -26,6 +35,7 @@ from torch.export import export
 
 
 class SizeAnalysisToolTest(unittest.TestCase):
+    @unittest.skipUnless(HAS_XNNPACK, "XNNPACK backend is not available in this build")
     def test_generate_model_size_analysis(self):
         class MyModel(torch.nn.Module):
             def __init__(self):

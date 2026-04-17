@@ -17,12 +17,17 @@ namespace vkcompute {
 std::vector<int64_t> calculate_broadcasted_output_size(
     const std::vector<int64_t>& sizes1,
     const std::vector<int64_t>& sizes2) {
-  std::vector<int64_t> out_sizes(std::max(sizes1.size(), sizes2.size()));
+  const size_t out_rank = std::max(sizes1.size(), sizes2.size());
+  std::vector<int64_t> out_sizes(out_rank);
 
-  // Match the sizes in reverse because sizes are in NCHW order
-  for (int i = -1; i >= -out_sizes.size(); --i) {
-    out_sizes.at(out_sizes.size() + i) =
-        std::max(utils::val_at(i, sizes1), utils::val_at(i, sizes2));
+  if (out_rank == 0) {
+    return out_sizes;
+  }
+
+  for (size_t i = 0; i < out_rank; ++i) {
+    const int64_t reverse_idx = -static_cast<int64_t>(i) - 1;
+    out_sizes.at(out_rank - 1 - i) = std::max(
+        utils::val_at(reverse_idx, sizes1), utils::val_at(reverse_idx, sizes2));
   }
 
   return out_sizes;

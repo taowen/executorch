@@ -97,12 +97,11 @@ void unsqueeze(ComputeGraph& graph, const std::vector<ValueRef>& args) {
   const ValueRef dims = args.at(idx++);
   const ValueRef out = args.at(idx++);
 
+  // Use view-based resize for both buffer and texture tensors.
+  // The texture-specific permute-based implementation can produce incorrect
+  // layout/broadcast behavior when unsqueeze feeds binary ops.
   std::vector<ValueRef> resize_args = {dims};
-  if (graph.is_buffer_storage(in)) {
-    return add_view_copy_node(
-        graph, in, out, resize_args, resize_unsqueeze_node);
-  }
-  return add_unsqueeze_node(graph, in, dims, out);
+  return add_view_copy_node(graph, in, out, resize_args, resize_unsqueeze_node);
 }
 
 REGISTER_OPERATORS {

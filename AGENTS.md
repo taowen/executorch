@@ -1,109 +1,169 @@
 # AGENTS.md
 
-## 最终目标
-把仓库收敛为 `exshader` 驱动的 **Pure Vulkan + Python-first** 架构：
-1. 运行主链路是 Pure Vulkan，不接受 CPU fallback 混跑。
-2. 高频研发在 Python 完成（融合边界、shader、loop、编排）。
-3. C++ 是低频稳定基座，不按任务类型复制 runner。
-4. 目标是减少 C++ 重编译，提升 agent 自主迭代速度。
+## 文档定位
+本文档只记录**源码层面的架构理解**与开发约束。  
+调试过程、实验记录、日志结论统一写入 `DEBUG.md`。
 
-## 硬约束
-1. 不要兼容层：同一能力只保留一条主路径。
-2. 不要 fallback：主链路出现 fallback 直接失败。
-3. 不计成本不计代价：优先架构一致性与演进效率。
-4. `tools/` 冻结：新增能力放 `exshader/`。
-5. 可交付流程禁止 runtime hack（`PYTHONPATH` 注入、临时 symlink 等）。
-6. 禁止任务专用 C++ runner 扩散（`ASRRunner/TTSRunner/...` 非目标）。
+---
 
-## C++/Python 接口总原则（本次更正）
+## 0. 固化命令（唯一入口）
 
-### 一句话
-**C++ 提供通用 method 执行原语，Python 承担全部任务语义。**
+所有构建/导出/运行都走 `exshader/scripts/*`，禁止手写临时 `cmake` 命令。
 
-### C++ 基座（允许做）
-1. Program/Session 生命周期：load、reload/reset、释放。
-2. Method 执行原语：method 枚举、method 元信息、execute。
-3. 输入输出与内存接口：类型/shape 检查、可复用 buffer、显式错误码。
-4. Vulkan runtime 能力与可观测性：性能计时、delegate/backend 信息。
+1. 构建（唯一入口）  
+   `bash exshader/scripts/build_vulkan.sh`  
+   清理重建：`bash exshader/scripts/build_vulkan.sh --clean`
+2. 导出 Qwen3 0.6B（Pure Vulkan）  
+   `bash exshader/scripts/export_qwen3.sh`
+3. 导出 Qwen3.5 0.8B（Pure Vulkan）  
+   `bash exshader/scripts/export_qwen3_5.sh`
+4. 运行 Qwen3 推理  
+   `bash exshader/scripts/run_qwen3.sh`
+5. 纯 Vulkan 检查  
+   `bash exshader/scripts/check_qwen3_pure_vulkan.sh`
+6. 构建 C++ `llama_main`（会先同步 install 库，避免旧库错链）  
+   `bash exshader/scripts/build_llama_main.sh`
+7. 运行 Qwen3.5 0.8B（`llama_main`）  
+   `bash exshader/scripts/run_qwen3_5_llama_main.sh`
+8. ETRecord + Inspector 主流程（单步 forward 采样）  
+   先导出时开启 ETRecord：  
+   `ET_GENERATE_ETRECORD=1 bash exshader/scripts/export_qwen3.sh`  
+   或  
+   `ET_GENERATE_ETRECORD=1 bash exshader/scripts/export_qwen3_5.sh`  
+   再生成 ETDump 并解析：  
+   `bash exshader/scripts/inspect_with_inspector.sh <pte_name>`
+9. Inspector 基线/候选自动对比报告  
+   `bash exshader/scripts/inspect_compare.sh <baseline_pte> <candidate_pte>`
 
-### C++ 基座（禁止做）
-1. 不引入任务语义 API（如 LLM/ASR/TTS 专用 loop）。
-2. 不在 C++ 实现产品级“采样策略/业务流程状态机”。
-3. 不通过新增任务专用 pybind 模块来解决模型差异。
+---
 
-### Python 层职责
-1. `exshader/runtime`：唯一对上暴露的运行时封装层。
-2. `exshader/recipes/*`：任务编排层（多次 forward、采样、多模块调度）。
-3. 融合边界与 shader 迭代：继续走 Python 导出/partition/JIT 链路。
+## 1. 总体架构（Pure Vulkan + Python-first）
 
-## 接口分层（执行标准）
+目标链路分两段：
+1. **导出链路（Python）**：PyTorch 图 -> EXIR Edge -> Vulkan delegate blobs -> `.pte`
+2. **执行链路（C++ Runtime + Vulkan backend）**：`.pte` -> Method init -> delegate init -> delegate execute
 
-### L0（基座接口，主路径）
-`exshader.runtime.Session` + `MethodHandle`：
-1. `Session.load(...)`
-2. `session.method(name)`
-3. `MethodHandle.meta()`
-4. `MethodHandle.run(inputs, clone_outputs=False)`
-5. `Session.reset_state()`
+核心原则：
+1. 融合、分区、编排优先在 Python 完成。
+2. C++ 负责稳定执行语义与后端实现，不承载任务特化 loop。
+3. 运行主链路是 Pure Vulkan（不设计混合 fallback 作为正常路径）。
 
-### L1（任务封装，可变）
-`exshader.recipes.llm_decode` 等 Python recipe：
-1. 只能依赖 L0。
-2. 可以快速改采样、chunk、cache 策略。
-3. 不要求改 C++。
+---
 
-### L2（历史/过渡接口，非主路径）
-`TextLLMRunner.prefill_tokens/decode_next_token` 这类任务语义接口：
-1. 可用于排障或实验。
-2. 不作为未来架构主干。
-3. 不以其成功与否决定平台方向。
+## 2. 源码入口与职责分层
 
-## 当前状态（聚焦接口）
-1. `exshader/runtime` 已存在，`Session/MethodHandle` 已可用。
-2. `exshader/runtime` 已补充接口草案中的核心类型：
-   - `SessionOptions`
-   - `RunResult/RunStats`
-   - method 级错误上下文信息（包含 method 名与输入摘要）。
-3. `exshader/recipes/llm_decode.py` 已收敛回 L0（`Session/MethodHandle`），不依赖 `TextLLMRunner` 任务接口。
-4. Qwen3 现状验证：
-   - `run_qwen3.sh` 可跑通。
-   - `check_qwen3_pure_vulkan.sh` 通过（`KernelCall=0, DelegateCall=1`）。
-5. `_llm_runner` 已支持 core-only 构建：
-   - `-DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER_TORCH_IO=OFF`
-   - 关闭后不导出 `make_image_input/make_audio_input/make_raw_audio_input`。
-6. `runner/__init__.py` 已移除 `import torch` 顶层硬依赖（torch-io helper 为可选符号）。
-7. 已验证 `_llm_runner` core 产物不链接 torch 动态库。
-8. `exshader/scripts/run_qwen3.sh` 与 `check_qwen3_pure_vulkan.sh` 已支持自动选择可用 Qwen3 PTE（避免默认文件名失效）。
-9. `_exshader_runtime` 已支持结构化运行统计（`host_input_ms/module_execute_ms/output_wrap_ms/elapsed_ms`），并已接入 `exshader.runtime.MethodHandle.run` 与 `exshader/recipes/llm_decode.py` 输出。
-10. Vulkan backend telemetry 已接入（`copy_inputs/resize/compute_graph_execute/copy_outputs/total_backend`）；`export_qwen3.sh` 新增 `ET_ENABLE_QUERYPOOL_PROFILE=1` 导出开关用于获取 `gpu_shader_total_ms/dispatch_count`。
-11. 已验证 `8da4w + emb4bit + enable_querypool` 导出可同时满足 Pure Vulkan 与 shader 级统计输出（`gpu_shader_total_ms`, `dispatch_count` 非 0）。
-12. `exshader/scripts/export_qwen3.sh` 默认导出参数已切到 `quantization.qmode=8da4w` + `quantization.embedding_quantize="4,32"`，避免默认导出触发 `KernelCall=1`。
+### 2.1 导出入口
+- `exshader/export_llm.py`
+  - 负责读取 Hydra 配置、环境校验、调用 `export_llama(...)`。
 
-## 下一阶段（只做两件事）
+### 2.2 LLM 导出编排
+- `examples/models/llama/export_llama_lib.py`
+  - `_validate_args(...)`：约束纯 Vulkan 分支配置。
+  - `_to_edge_and_lower_llama(...)`：关键主流程  
+    `pt2e_quantize -> export_to_edge -> to_backend(partitioners) -> to_executorch`
+  - `export_llama(...)`：汇总模型装载、变换、量化、lowering、落盘。
 
-### M4-3（P0）：把 LLM recipe 严格收敛到 L0
-1. 已完成：`exshader/recipes/llm_decode.py` 只使用 `Session/MethodHandle`。
-2. 已完成：固化内存复用策略（预分配 + in-place + `clone_outputs=False`）。
-3. 已达成当前验收：Qwen3 跑通、脚本不依赖任务专用 C++ API。
+### 2.3 分区器构造
+- `extension/llm/export/partitioner_lib.py`
+  - `get_vulkan_partitioner(...)`：创建 `VulkanPartitioner`。
+  - `compile_options` 与 allow/blocklist 由配置与 `ET_VULKAN_PARTITIONER_PROFILE` 驱动。
 
-### M4-4（P0）：继续去 torch 运行时硬依赖
-1. 已完成：`runner/__init__.py` 去掉顶层 `import torch`，改为按需加载。
-2. 已完成：core-only `_llm_runner` 下缺失 `make_image_input/make_audio_input` 不再导致导入失败（降级为可选符号）。
-3. 已完成：禁 torch 条件下验证 `import executorch.extension.llm.runner` 可成功。
-4. 持续项：继续清理其他非主路径（文档/测试）中的 torch 假设，但不阻塞 exshader 主链路。
+### 2.4 Backend lowering 通用层
+- `exir/backend/backend_api.py`
+  - `to_backend(...)`：按 backend id 调用对应 `preprocess(...)`。
+  - `_partition_and_lower_*`：按 delegation tag 建 submodule 并 lowered。
+  - `_insert_lowered_submodule(...)`：把 `call_module` 替换成 `executorch_call_delegate(...)`。
 
-## 目录约定
-- `backends/vulkan/runtime/`：低频 C++ 基座（原地演进，不迁目录）。
-- `backends/vulkan/patterns/` + `backends/vulkan/vulkan_preprocess.py` + `backends/vulkan/partitioner/`：融合与分区。
-- `exshader/export_llm.py`：唯一导出入口。
-- `exshader/runtime/`：通用运行时接口（主战场）。
-- `exshader/recipes/`：Python 任务编排层（当前只推进 LLM）。
-- `exshader/shader_jit/`：shader bundle 构建与热替换。
-- `exshader/scripts/`：固定脚本入口。
-- `artifacts/`：统一产物目录。
-- `tools/`：冻结，不新增功能。
+### 2.5 Vulkan backend preprocess（编译前端）
+- `backends/vulkan/vulkan_preprocess.py`
+  - `VulkanBackend.preprocess(...)`：执行 Vulkan 专属 pass pipeline。
+  - 输出 `processed_bytes`（Vulkan 图 + 常量数据 + header），写入 delegate data。
 
-## 验收口径
-1. 纯 Vulkan：runtime fallback=0；静态 `KernelCall` 持续追踪并优化。
-2. 迭代效率：改融合/改shader/改loop 不重编译 C++ 主体。
-3. 架构一致性：任务能力优先在 Python recipe 扩展，不新增任务专用 C++ runner。
+### 2.6 Runtime 执行核心
+- `runtime/executor/method.cpp`
+  - `Method::init(...)`：
+    - 解析 values
+    - 初始化 delegates（`BackendDelegate::Init`）
+    - 解析 chains/instructions（含 `DelegateCall` 参数索引）
+  - `Method::execute(...)`：按 instruction 派发 KernelCall / DelegateCall。
+
+### 2.7 Vulkan backend 运行时实现
+- `backends/vulkan/runtime/VulkanBackend.cpp`
+  - `init(...)`：读取 compile specs，构建 `ComputeGraph`，反序列化并 `compileModel(...)`。
+  - `execute(...)`：输入拷贝/resize/graph execute/输出拷贝。
+
+---
+
+## 3. 关键数据与 ABI 契约
+
+### 3.1 Delegate 契约（ExecutionPlan 级）
+1. `execution_plan.delegates[i]` 的顺序即 `DelegateCall.delegate_index` 的索引语义。
+2. Delegate 初始化在 `Method::init` 完成；若任一 delegate init 失败，方法初始化失败，不会进入执行阶段。
+
+### 3.2 DelegateCall 参数契约
+1. `DelegateCall.args` 是 values 表索引列表。
+2. Runtime 在 init 阶段将索引解析为 `Span<EValue*>` 参数表，执行时直接传给 backend。
+3. Vulkan backend 在 execute 中按自身 graph 的 `num_inputs/num_outputs` 消费该参数表：
+   - 前段对应 inputs
+   - 尾段对应 outputs
+4. 因此导出侧 `call_delegate` 参数构造顺序与 runtime/backend 解释必须一致。
+
+### 3.3 Lowering 时输入裁剪契约
+1. `_insert_lowered_submodule(...)` 会从 `call_module.args` 中剔除该分区“自有常量”（参数/缓冲），仅保留 user inputs 进入 `executorch_call_delegate`。
+2. 常量通过 lowered module 内状态与 serialized delegate data 传递，不应重复出现在 runtime call args。
+
+### 3.4 CompileSpec 契约
+1. Python 侧写入 `CompileSpec(key, value-bytes)`。
+2. Runtime 透明传递到 backend init，不解释 key 语义。
+3. Vulkan backend 在 `get_graph_config(...)`/`get_shader_bundle_path(...)` 解释具体 key（如 `require_dynamic_shapes`, `force_fp16`, `shader_bundle_path`）。
+
+### 3.5 Processed Bytes 契约
+1. `preprocess(...)` 产物是 backend 私有格式（对 runtime 不透明）。
+2. Vulkan backend 通过 `VulkanDelegateHeader` + `VkGraph` identifier 校验与解析。
+3. Delegate data 索引（inline/segment + index）由 execution plan 存储并在 init 取回。
+
+---
+
+## 4. 典型控制流（从导出到执行）
+
+1. `exshader/export_llm.py` 调 `export_llama(...)`。
+2. 模型转 Edge 后调用 `to_backend([VulkanPartitioner])`。
+3. `backend_api` 根据 delegation tags 生成多个 lowered submodules。
+4. 每个 submodule 调 `VulkanBackend.preprocess(...)` 生成一个 delegate blob。
+5. 序列化为 `.pte`：ExecutionPlan 内含 delegates 列表、chains、DelegateCall 指令。
+6. C++ 加载 `.pte`，`Method::init` 先逐个 init delegates，再解析 instructions。
+7. `Method::execute` 遇到 `DelegateCall` 时，将预解析参数列表传入 Vulkan backend `execute(...)`。
+
+---
+
+## 5. “哪里改什么”规则
+
+### 5.1 需要改 Python 的场景
+1. 调整算子融合边界、分区策略、allow/blocklist。
+2. 调整导出 pass 组合或 compile options。
+3. 调整模型 loop/编排（prefill/decode 调度）逻辑。
+
+### 5.2 需要改 C++ 的场景
+1. Runtime ABI 语义、Method/delegate 生命周期语义变更。
+2. Vulkan backend 执行语义、图构建、shader 执行机制变更。
+3. 新 backend capability 需要 runtime/backend 协同支持。
+
+### 5.3 不应混用的改法
+1. 不用任务专用 C++ runner 去“绕过”导出/ABI问题。
+2. 不用临时 fallback 掩盖 delegate 初始化或参数契约问题。
+3. 不在 `AGENTS.md` 写临时调试结论。
+
+---
+
+## 6. 可观测性接口（架构资产）
+
+这些是架构层长期可复用能力，不是一次性日志：
+1. `ET_EXSHADER_ABI_DUMP_PATH`：导出侧 submodule/call_delegate 契约快照（JSONL）。
+2. `ET_DELEGATE_ABI_TRACE_PATH`：runtime 侧 delegate init 与 DelegateCall 参数索引快照（JSONL）。
+3. `exshader/diag/abi_diff.py`：baseline/candidate 结构化 ABI 对比工具。
+
+---
+
+## 7. 文档边界
+1. `AGENTS.md`：架构、契约、规则、长期接口。
+2. `DEBUG.md`：每次实验命令、结果、失败点、时间线。

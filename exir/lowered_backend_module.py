@@ -406,6 +406,7 @@ def arrange_graph_placeholders(
     # Cache these properties — each call rebuilds the dict from input_specs.
     params_map = graph_sign.inputs_to_parameters
     buffers_map = graph_sign.inputs_to_buffers
+    mutable_buffer_targets = set(graph_sign.buffers_to_mutate.values())
     param_nodes = []
     buffer_nodes = []
     input_nodes = []
@@ -413,9 +414,16 @@ def arrange_graph_placeholders(
         if node.op != "placeholder":
             continue
 
+        is_mutable_buffer = (
+            node.name in buffers_map and buffers_map[node.name] in mutable_buffer_targets
+        )
         if node.name in params_map and node.meta.get("delegation_tag", None) == tag:
             param_nodes.append(node)
-        elif node.name in buffers_map and node.meta.get("delegation_tag", None) == tag:
+        elif (
+            node.name in buffers_map
+            and node.meta.get("delegation_tag", None) == tag
+            and not is_mutable_buffer
+        ):
             buffer_nodes.append(node)
         else:
             input_nodes.append(node)
@@ -602,6 +610,7 @@ def _get_new_signature(  # noqa: C901
     if not is_submodule:
         for output_spec in old_signature.output_specs:
             toplevel_output_node_to_sig[output_spec.arg.name].append(output_spec)
+    mutable_buffer_targets = set(original_program.graph_signature.buffers_to_mutate.values())
 
     for node in gm.graph.nodes:
         if node.op == "placeholder":
@@ -617,9 +626,21 @@ def _get_new_signature(  # noqa: C901
                 continue
 
             orig_input_spec = input_node_to_sig[node.name]
+            is_mutable_buffer = (
+                orig_input_spec.kind == InputKind.BUFFER
+                and orig_input_spec.target in mutable_buffer_targets
+            )
 
             if not isinstance(orig_input_spec.arg, TensorArgument):
                 input_specs.append(orig_input_spec)
+            elif is_mutable_buffer:
+                input_specs.append(
+                    InputSpec(
+                        kind=InputKind.USER_INPUT,
+                        arg=TensorArgument(name=node.name),
+                        target=None,
+                    )
+                )
 
             elif node.meta.get("delegation_tag", None) == tag:
                 input_specs.append(orig_input_spec)

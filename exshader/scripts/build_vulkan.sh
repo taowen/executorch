@@ -10,11 +10,15 @@ if [[ "${1:-}" == "--clean" ]]; then
   rm -rf "$ET_BUILD_DIR"
 fi
 
+BUILD_TYPE="RelWithDebInfo"
+
 cmake -S . -B "$ET_BUILD_DIR" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$ET_BUILD_DIR/install" \
+  -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
   -DPYTHON_EXECUTABLE="$REPO_ROOT/.venv/bin/python" \
   -DEXECUTORCH_BUILD_VULKAN=ON \
+  -DEXECUTORCH_BUILD_DEVTOOLS=ON \
+  -DEXECUTORCH_ENABLE_EVENT_TRACER=ON \
+  -DEXECUTORCH_BUILD_PYBIND=ON \
   -DEXECUTORCH_BUILD_XNNPACK=OFF \
   -DEXECUTORCH_BUILD_COREML=OFF \
   -DEXECUTORCH_BUILD_OPENVINO=OFF \
@@ -30,16 +34,11 @@ cmake -S . -B "$ET_BUILD_DIR" \
   -DEXECUTORCH_BUILD_KERNELS_LLM=ON \
   -DEXECUTORCH_BUILD_KERNELS_LLM_AOT=ON
 
-cmake --build "$ET_BUILD_DIR" -j"$(nproc)" --target install --config Release
+cmake --build "$ET_BUILD_DIR" -j"$(nproc)" --target \
+  executor_runner \
+  portable_lib \
+  custom_ops_aot_lib
 
-cmake -S examples/models/llama -B "$ET_BUILD_DIR/examples/models/llama" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DPYTHON_EXECUTABLE="$REPO_ROOT/.venv/bin/python" \
-  -DCMAKE_PREFIX_PATH="$ET_BUILD_DIR/install" \
-  -DEXECUTORCH_BUILD_VULKAN=ON \
-  -DEXECUTORCH_BUILD_XNNPACK=OFF
-
-cmake --build "$ET_BUILD_DIR/examples/models/llama" -j"$(nproc)" --config Release
-
-echo "[build_vulkan] done"
+echo "[build_vulkan] done (build_type=$BUILD_TYPE)"
 echo "[build_vulkan] ET_BUILD_DIR=$ET_BUILD_DIR"
+file "$ET_BUILD_DIR/executor_runner" | sed 's/^/[build_vulkan] /'

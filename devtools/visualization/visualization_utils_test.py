@@ -9,7 +9,14 @@ import time
 import pytest
 import torch
 from executorch.backends.arm._passes.decompose_linear_pass import DecomposeLinearPass
-from executorch.backends.xnnpack.test.tester import Tester
+
+try:
+    from executorch.backends.xnnpack.test.tester import Tester
+
+    HAS_XNNPACK = True
+except ModuleNotFoundError:
+    Tester = None
+    HAS_XNNPACK = False
 
 from executorch.devtools.visualization import (
     ModelExplorerServer,
@@ -90,6 +97,8 @@ def test_visualize_manual_export(server):
 
 
 def test_visualize_exported_program(server):
+    if not HAS_XNNPACK:
+        pytest.skip("XNNPACK backend is not available in this build.")
     with server():
         model = Linear(20, 30)
         (
@@ -103,6 +112,8 @@ def test_visualize_exported_program(server):
 
 
 def test_visualize_to_edge(server):
+    if not HAS_XNNPACK:
+        pytest.skip("XNNPACK backend is not available in this build.")
     with server():
         model = Linear(20, 30)
         (
@@ -117,6 +128,8 @@ def test_visualize_to_edge(server):
 
 
 def test_visualize_partition(server):
+    if not HAS_XNNPACK:
+        pytest.skip("XNNPACK backend is not available in this build.")
     with server():
         model = Linear(20, 30)
         (
@@ -132,6 +145,8 @@ def test_visualize_partition(server):
 
 
 def test_visualize_to_executorch(server):
+    if not HAS_XNNPACK:
+        pytest.skip("XNNPACK backend is not available in this build.")
     with server():
         model = Linear(20, 30)
         (

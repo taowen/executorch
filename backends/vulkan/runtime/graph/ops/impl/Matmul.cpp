@@ -30,6 +30,13 @@ void resize_matmul_tiled_node(
 
   const std::vector<int64_t> mat1_sizes = graph->sizes_of(mat1);
   const std::vector<int64_t> mat2_sizes = graph->sizes_of(mat2);
+  if (mat1_sizes.size() < 2 || mat2_sizes.empty()) {
+    VK_THROW(
+        "matmul resize expects mat1 rank >= 2 and mat2 rank >= 1, got mat1 rank ",
+        mat1_sizes.size(),
+        " and mat2 rank ",
+        mat2_sizes.size());
+  }
 
   std::vector<int64_t> new_out_sizes(mat1_sizes);
   new_out_sizes.at(new_out_sizes.size() - 1) = mat2_sizes.back();

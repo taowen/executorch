@@ -25,7 +25,6 @@ import torch
 import torch.fx
 import torch.utils._pytree as pytree
 
-from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
 from executorch.devtools import generate_etrecord, parse_etrecord
 from executorch.devtools.debug_format.et_schema import OperatorNode
 from executorch.devtools.etdump.schema_flatcc import ProfileEvent
@@ -225,6 +224,40 @@ class TestInspector(unittest.TestCase):
         )
         expected_ops = ["op"]
         self.assertEqual(event_with_single_debug_handle.op_types, expected_ops)
+
+    def test_inspector_populates_vulkan_delegate_metadata_for_local_debug_event(self):
+        profile_event = Event(
+            name='{{"operator": {"name": "aten.where.self"}, "kernel_name": "where_texture3d_float", "delegate_debug_id": 7}, "dispatch_id": 7}',
+            delegate_debug_identifier='{{"operator": {"name": "aten.where.self"}, "kernel_name": "where_texture3d_float", "delegate_debug_id": 7}, "dispatch_id": 7}',
+            _instruction_id=14,
+        )
+        debug_event = Event(
+            name="7",
+            delegate_debug_identifier=7,
+            _instruction_id=14,
+        )
+        event_block = EventBlock(name="Execute", events=[profile_event, debug_event])
+
+        event_block._gen_resolve_debug_handles(
+            handle_map={"14": [111]},
+            delegate_map={
+                "14": {
+                    "name": "VulkanBackend",
+                    "delegate_map": {7: [111]},
+                }
+            },
+        )
+
+        self.assertEqual(debug_event.delegate_backend_name, "VulkanBackend")
+        self.assertEqual(debug_event.debug_handles, [111])
+        self.assertEqual(debug_event.delegate_kernel_name, "where_texture3d_float")
+        self.assertEqual(debug_event.delegate_operator_name, "aten.where.self")
+        self.assertEqual(debug_event.delegate_dispatch_id, 7)
+
+        self.assertEqual(profile_event.debug_handles, [111])
+        self.assertEqual(profile_event.delegate_kernel_name, "where_texture3d_float")
+        self.assertEqual(profile_event.delegate_operator_name, "aten.where.self")
+        self.assertEqual(profile_event.delegate_dispatch_id, 7)
 
     def test_inspector_associate_with_op_graph_nodes_multiple_debug_handles(self):
         # Test on an event with a sequence of debug handles
@@ -1506,12 +1539,16 @@ class TestInspector(unittest.TestCase):
         and lowered to XNNPACK, the intermediate outputs during runtime closely
         match the expected AOT outputs, with gaps remaining within a small range.
         """
-        from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
-            XnnpackPartitioner,
-        )
-        from executorch.backends.xnnpack.utils.configs import (
-            get_xnnpack_edge_compile_config,
-        )
+        try:
+            from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+                XnnpackPartitioner,
+            )
+            from executorch.backends.xnnpack.utils.configs import (
+                get_xnnpack_edge_compile_config,
+            )
+        except ModuleNotFoundError:
+            self.skipTest("XNNPACK backend is not available in this build.")
+
         from executorch.runtime import Method, Program, Runtime, Verification
         from torch import nn as nn
 
@@ -1715,6 +1752,13 @@ class TestInspector(unittest.TestCase):
         # Create test model and inputs
         model = SimpleTestModel(hidden_size=32, num_layers=2)
         model.eval()
+
+        try:
+            from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+                XnnpackPartitioner,
+            )
+        except ModuleNotFoundError:
+            self.skipTest("XNNPACK backend is not available in this build.")
 
         # Create representative inputs (smaller for faster testing)
         batch_size, seq_len, hidden_size = 1, 8, 32

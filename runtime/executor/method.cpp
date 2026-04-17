@@ -12,7 +12,11 @@
 #include <array>
 #include <cinttypes> // @donotremove
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
+#include <exception>
+#include <string>
 
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/event_tracer_hooks.h>
@@ -34,6 +38,62 @@
 
 namespace executorch {
 namespace ET_RUNTIME_NAMESPACE {
+
+namespace {
+
+void append_method_load_trace(
+    const char* stage,
+    const char* method_name,
+    const char* what) {
+  const char* path = std::getenv("ET_METHOD_LOAD_TRACE_PATH");
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  FILE* f = std::fopen(path, "a");
+  if (f == nullptr) {
+    return;
+  }
+  std::fprintf(
+      f,
+      "{\"stage\":\"%s\",\"method\":\"%s\",\"what\":\"%s\"}\n",
+      stage != nullptr ? stage : "",
+      method_name != nullptr ? method_name : "",
+      what != nullptr ? what : "");
+  std::fclose(f);
+}
+
+template <typename Fn>
+Error run_init_stage(
+    const char* stage,
+    const char* method_name,
+    Fn&& fn) {
+#if defined(__cpp_exceptions)
+  try {
+    return fn();
+  } catch (const std::exception& ex) {
+    ET_LOG(
+        Error,
+        "Method::init stage %s threw C++ exception for method %s: %s",
+        stage,
+        method_name,
+        ex.what());
+    append_method_load_trace(stage, method_name, ex.what());
+    return Error::Internal;
+  } catch (...) {
+    ET_LOG(
+        Error,
+        "Method::init stage %s threw unknown C++ exception for method %s",
+        stage,
+        method_name);
+    append_method_load_trace(stage, method_name, "unknown C++ exception");
+    return Error::Internal;
+  }
+#else
+  return fn();
+#endif
+}
+
+} // namespace
 
 using internal::PlatformMemoryAllocator;
 
@@ -102,10 +162,108 @@ class BackendDelegate final {
     new (&out->segment_) FreeableBuffer(std::move(processed_data.get()));
 
     // Initialize the delegate.
-    Result<DelegateHandle*> handle = backend->init(
-        backend_init_context,
-        &out->segment_,
-        ArrayRef<CompileSpec>(compile_specs, num_compile_specs));
+    Result<DelegateHandle*> handle =
+#if defined(__cpp_exceptions)
+        [&]() -> Result<DelegateHandle*> {
+      auto append_init_exception_trace = [&](const char* what) {
+        const char* path = std::getenv("ET_DELEGATE_ABI_TRACE_PATH");
+        if (path == nullptr || path[0] == '\0') {
+          return;
+        }
+        FILE* f = std::fopen(path, "a");
+        if (f == nullptr) {
+          return;
+        }
+        std::fputs(
+            "{\"source\":\"runtime\",\"event\":\"delegate_init_exception\",\"backend_id\":\"",
+            f);
+        for (const unsigned char c : std::string(backend_id)) {
+          switch (c) {
+            case '"':
+              std::fputs("\\\"", f);
+              break;
+            case '\\':
+              std::fputs("\\\\", f);
+              break;
+            case '\n':
+              std::fputs("\\n", f);
+              break;
+            case '\r':
+              std::fputs("\\r", f);
+              break;
+            case '\t':
+              std::fputs("\\t", f);
+              break;
+            default:
+              if (c < 0x20) {
+                std::fputs("\\u001f", f);
+              } else {
+                std::fputc(static_cast<int>(c), f);
+              }
+              break;
+          }
+        }
+        std::fputs("\",\"what\":\"", f);
+        if (what != nullptr) {
+          for (const unsigned char c : std::string(what)) {
+            switch (c) {
+              case '"':
+                std::fputs("\\\"", f);
+                break;
+              case '\\':
+                std::fputs("\\\\", f);
+                break;
+              case '\n':
+                std::fputs("\\n", f);
+                break;
+              case '\r':
+                std::fputs("\\r", f);
+                break;
+              case '\t':
+                std::fputs("\\t", f);
+                break;
+              default:
+                if (c < 0x20) {
+                  std::fputs("\\u001f", f);
+                } else {
+                  std::fputc(static_cast<int>(c), f);
+                }
+                break;
+            }
+          }
+        }
+        std::fputs("\"}\n", f);
+        std::fclose(f);
+      };
+      try {
+        return backend->init(
+            backend_init_context,
+            &out->segment_,
+            ArrayRef<CompileSpec>(compile_specs, num_compile_specs));
+      } catch (const std::exception& ex) {
+        ET_LOG(
+            Error,
+            "Init threw C++ exception for backend %s: %s",
+            backend_id,
+            ex.what());
+        append_init_exception_trace(ex.what());
+        return Error::Internal;
+      } catch (...) {
+        ET_LOG(
+            Error,
+            "Init threw unknown C++ exception for backend %s",
+            backend_id);
+        append_init_exception_trace("unknown C++ exception");
+        return Error::Internal;
+      }
+    }()
+#else
+        backend->init(
+            backend_init_context,
+            &out->segment_,
+            ArrayRef<CompileSpec>(compile_specs, num_compile_specs))
+#endif
+        ;
     if (!handle.ok()) {
       ET_LOG(
           Error,
@@ -226,6 +384,239 @@ struct Chain {
 };
 
 namespace {
+
+using DelegateCallArgsInProgram = executorch_flatbuffer::DelegateCall;
+
+const char* get_delegate_abi_trace_path() {
+  static const char* kPath = std::getenv("ET_DELEGATE_ABI_TRACE_PATH");
+  if (kPath == nullptr || kPath[0] == '\0') {
+    return nullptr;
+  }
+  return kPath;
+}
+
+bool delegate_abi_trace_enabled() {
+  return get_delegate_abi_trace_path() != nullptr;
+}
+
+std::string json_escape(const char* in) {
+  if (in == nullptr) {
+    return "";
+  }
+  std::string out;
+  out.reserve(std::strlen(in) + 8);
+  for (const unsigned char c : std::string(in)) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (c < 0x20) {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += static_cast<char>(c);
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+void append_delegate_abi_trace_line(const std::string& line) {
+  const char* path = get_delegate_abi_trace_path();
+  if (path == nullptr) {
+    return;
+  }
+  FILE* f = std::fopen(path, "a");
+  if (f == nullptr) {
+    ET_LOG(
+        Error,
+        "Failed to open ET_DELEGATE_ABI_TRACE_PATH for append: %s",
+        path);
+    return;
+  }
+  std::fwrite(line.data(), 1, line.size(), f);
+  std::fwrite("\n", 1, 1, f);
+  std::fclose(f);
+}
+
+void trace_delegate_init_event(
+    const char* phase,
+    const char* method_name,
+    size_t delegate_index,
+    const executorch_flatbuffer::BackendDelegate& delegate,
+    Error err = Error::Ok) {
+  if (!delegate_abi_trace_enabled()) {
+    return;
+  }
+
+  const auto* compile_specs = delegate.compile_specs();
+  const size_t compile_spec_count =
+      compile_specs == nullptr ? 0 : compile_specs->size();
+  const auto* processed = delegate.processed();
+  const uint32_t processed_location = processed == nullptr
+      ? static_cast<uint32_t>(executorch_flatbuffer::DataLocation::INLINE)
+      : static_cast<uint32_t>(processed->location());
+  const uint32_t processed_index = processed == nullptr ? 0 : processed->index();
+
+  std::string line = "{";
+  line += "\"source\":\"runtime\"";
+  line += ",\"event\":\"";
+  line += json_escape(phase);
+  line += "\"";
+  line += ",\"method\":\"";
+  line += json_escape(method_name);
+  line += "\"";
+  line += ",\"delegate_index\":";
+  line += std::to_string(delegate_index);
+  line += ",\"backend_id\":\"";
+  line += json_escape(delegate.id() == nullptr ? "" : delegate.id()->c_str());
+  line += "\"";
+  line += ",\"processed_location\":";
+  line += std::to_string(processed_location);
+  line += ",\"processed_index\":";
+  line += std::to_string(processed_index);
+  line += ",\"error_code\":";
+  line += std::to_string(static_cast<uint32_t>(err));
+  line += ",\"compile_specs\":[";
+  for (size_t i = 0; i < compile_spec_count; ++i) {
+    const auto* spec = compile_specs->Get(i);
+    const char* key = "";
+    size_t nbytes = 0;
+    if (spec != nullptr) {
+      key = spec->key() == nullptr ? "" : spec->key()->c_str();
+      nbytes = spec->value() == nullptr ? 0 : spec->value()->size();
+    }
+    if (i > 0) {
+      line += ",";
+    }
+    line += "{";
+    line += "\"key\":\"";
+    line += json_escape(key);
+    line += "\"";
+    line += ",\"nbytes\":";
+    line += std::to_string(nbytes);
+    line += "}";
+  }
+  line += "]}";
+  append_delegate_abi_trace_line(line);
+}
+
+void trace_delegate_call_instruction(
+    const char* method_name,
+    size_t chain_idx,
+    size_t instr_idx,
+    uint32_t delegate_index,
+    const flatbuffers::Vector<int32_t>* arg_indices) {
+  if (!delegate_abi_trace_enabled()) {
+    return;
+  }
+  const size_t n_args = arg_indices == nullptr ? 0 : arg_indices->size();
+  std::string line = "{";
+  line += "\"source\":\"runtime\"";
+  line += ",\"event\":\"delegate_call_instruction\"";
+  line += ",\"method\":\"";
+  line += json_escape(method_name);
+  line += "\"";
+  line += ",\"chain_index\":";
+  line += std::to_string(chain_idx);
+  line += ",\"instruction_index\":";
+  line += std::to_string(instr_idx);
+  line += ",\"delegate_index\":";
+  line += std::to_string(delegate_index);
+  line += ",\"arg_indices\":[";
+  for (size_t i = 0; i < n_args; ++i) {
+    if (i > 0) {
+      line += ",";
+    }
+    line += std::to_string(arg_indices->Get(i));
+  }
+  line += "]}";
+  append_delegate_abi_trace_line(line);
+}
+
+void trace_delegate_call_runtime_args(
+    const char* method_name,
+    size_t chain_idx,
+    size_t instr_idx,
+    uint32_t delegate_index,
+    InstructionArgs args) {
+  if (!delegate_abi_trace_enabled()) {
+    return;
+  }
+  std::string line = "{";
+  line += "\"source\":\"runtime\"";
+  line += ",\"event\":\"delegate_call_runtime_args\"";
+  line += ",\"method\":\"";
+  line += json_escape(method_name);
+  line += "\"";
+  line += ",\"chain_index\":";
+  line += std::to_string(chain_idx);
+  line += ",\"instruction_index\":";
+  line += std::to_string(instr_idx);
+  line += ",\"delegate_index\":";
+  line += std::to_string(delegate_index);
+  line += ",\"args\":[";
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (i > 0) {
+      line += ",";
+    }
+    EValue* arg = args[i];
+    line += "{";
+    line += "\"pos\":";
+    line += std::to_string(i);
+    if (arg == nullptr) {
+      line += ",\"kind\":\"null\"";
+      line += "}";
+      continue;
+    }
+    line += ",\"tag\":";
+    line += std::to_string(static_cast<uint32_t>(arg->tag));
+    if (arg->isTensor()) {
+      const executorch::aten::Tensor& t = arg->toTensor();
+      line += ",\"kind\":\"tensor\"";
+      line += ",\"ndim\":";
+      line += std::to_string(static_cast<size_t>(t.dim()));
+      line += ",\"sizes\":[";
+      for (size_t d = 0; d < t.dim(); ++d) {
+        if (d > 0) {
+          line += ",";
+        }
+        line += std::to_string(t.sizes()[d]);
+      }
+      line += "]";
+    } else if (arg->isInt()) {
+      line += ",\"kind\":\"int\"";
+      line += ",\"value\":";
+      line += std::to_string(arg->toInt());
+    } else if (arg->isBool()) {
+      line += ",\"kind\":\"bool\"";
+      line += ",\"value\":";
+      line += arg->toBool() ? "true" : "false";
+    } else if (arg->isDouble()) {
+      line += ",\"kind\":\"double\"";
+    } else {
+      line += ",\"kind\":\"other\"";
+    }
+    line += "}";
+  }
+  line += "]}";
+  append_delegate_abi_trace_line(line);
+}
 
 Result<InstructionArgs> gen_instruction_arguments(
     MemoryAllocator* method_allocator,
@@ -828,7 +1219,10 @@ Result<Method> Method::load(
   }
   Method method(program, memory_manager, event_tracer, temp_allocator);
   ET_LOG(Debug, "Loading method: %s.", s_plan->name()->c_str());
-  Error err = method.init(s_plan, external_data_map, backend_options);
+  Error err =
+      run_init_stage("Method::load.init", s_plan->name()->c_str(), [&]() {
+        return method.init(s_plan, external_data_map, backend_options);
+      });
   if (err != Error::Ok) {
     return err;
   } else {
@@ -865,7 +1259,10 @@ Error Method::init(
 
   {
     // Parse the elements of the values_ array.
-    Error err = parse_values(external_data_map);
+    Error err = run_init_stage(
+        "Method::init.parse_values",
+        serialization_plan_->name()->c_str(),
+        [&]() { return parse_values(external_data_map); });
     if (err != Error::Ok) {
       return err;
     }
@@ -873,235 +1270,281 @@ Error Method::init(
 
   {
     // Resolve delegates
-    const auto delegates = serialization_plan_->delegates();
-    ET_CHECK_OR_RETURN_ERROR(
-        delegates != nullptr, InvalidProgram, "Missing delegates field");
-    size_t n_delegate = delegates->size();
-    delegates_ = method_allocator->allocateList<BackendDelegate>(n_delegate);
-    if (delegates_ == nullptr) {
-      ET_LOG(
-          Error, "Failed to allocate delegates array of size %zu", n_delegate);
-      return Error::MemoryAllocationFailed;
-    }
+    Error err = run_init_stage(
+        "Method::init.resolve_delegates",
+        serialization_plan_->name()->c_str(),
+        [&]() -> Error {
+          const auto delegates = serialization_plan_->delegates();
+          ET_CHECK_OR_RETURN_ERROR(
+              delegates != nullptr, InvalidProgram, "Missing delegates field");
+          size_t n_delegate = delegates->size();
+          delegates_ = method_allocator->allocateList<BackendDelegate>(n_delegate);
+          if (delegates_ == nullptr) {
+            ET_LOG(
+                Error,
+                "Failed to allocate delegates array of size %zu",
+                n_delegate);
+            return Error::MemoryAllocationFailed;
+          }
 
-    // Get PTE data map, if it exists.
-    auto pte_data_map = program_->get_named_data_map();
-    ET_CHECK_OR_RETURN_ERROR(
-        pte_data_map.ok() || pte_data_map.error() == Error::NotFound,
-        InvalidProgram,
-        "Failed to get named data map from program: 0x%" PRIx32,
-        static_cast<uint32_t>(pte_data_map.error()));
+          // Get PTE data map, if it exists.
+          auto pte_data_map = program_->get_named_data_map();
+          ET_CHECK_OR_RETURN_ERROR(
+              pte_data_map.ok() || pte_data_map.error() == Error::NotFound,
+              InvalidProgram,
+              "Failed to get named data map from program: 0x%" PRIx32,
+              static_cast<uint32_t>(pte_data_map.error()));
 
-    const NamedDataMap* named_data_map = nullptr;
-    if (external_data_map && pte_data_map.ok()) {
-      // Merge external_data_map and pte_data_map if both are present.
-      auto merged =
-          internal::MergedDataMap::load(external_data_map, pte_data_map.get());
-      if (!merged.ok()) {
-        return merged.error();
-      }
-      // Allocate memory for the merged data map.
-      merged_data_map_ =
-          method_allocator->allocateInstance<internal::MergedDataMap>();
-      if (merged_data_map_ == nullptr) {
-        ET_LOG(Error, "Failed to allocate MergedDataMap");
-        return Error::MemoryAllocationFailed;
-      }
-      new (merged_data_map_) internal::MergedDataMap(std::move(merged.get()));
-      named_data_map = merged_data_map_;
-    } else if (external_data_map) {
-      named_data_map = external_data_map;
-    } else if (pte_data_map.ok()) {
-      named_data_map = pte_data_map.get();
-    }
+          const NamedDataMap* named_data_map = nullptr;
+          if (external_data_map && pte_data_map.ok()) {
+            // Merge external_data_map and pte_data_map if both are present.
+            auto merged = internal::MergedDataMap::load(
+                external_data_map, pte_data_map.get());
+            if (!merged.ok()) {
+              return merged.error();
+            }
+            // Allocate memory for the merged data map.
+            merged_data_map_ =
+                method_allocator->allocateInstance<internal::MergedDataMap>();
+            if (merged_data_map_ == nullptr) {
+              ET_LOG(Error, "Failed to allocate MergedDataMap");
+              return Error::MemoryAllocationFailed;
+            }
+            new (merged_data_map_)
+                internal::MergedDataMap(std::move(merged.get()));
+            named_data_map = merged_data_map_;
+          } else if (external_data_map) {
+            named_data_map = external_data_map;
+          } else if (pte_data_map.ok()) {
+            named_data_map = pte_data_map.get();
+          }
 
-    // n_delegate_ counts the number of successfully-initialized delegates for
-    // ~Method() to clean up, and is incremented at the bottom of the loop. This
-    // makes it safe for errors to return without updating any state.
-    n_delegate_ = 0;
+          // n_delegate_ counts the number of successfully-initialized delegates for
+          // ~Method() to clean up, and is incremented at the bottom of the loop.
+          n_delegate_ = 0;
 
-    for (size_t i = 0; i < n_delegate; ++i) {
-      const auto& delegate = *delegates->Get(i);
+          for (size_t i = 0; i < n_delegate; ++i) {
+            const auto& delegate = *delegates->Get(i);
+            trace_delegate_init_event(
+                "delegate_init_begin",
+                serialization_plan_->name()->c_str(),
+                i,
+                delegate);
 
-      // Get per-delegate runtime specs from the LoadBackendOptionsMap if
-      // provided
-      Span<const BackendOption> delegate_runtime_specs;
-      if (backend_options != nullptr && delegate.id() != nullptr) {
-        delegate_runtime_specs =
-            backend_options->get_options(delegate.id()->c_str());
-      }
+            Span<const BackendOption> delegate_runtime_specs;
+            if (backend_options != nullptr && delegate.id() != nullptr) {
+              delegate_runtime_specs =
+                  backend_options->get_options(delegate.id()->c_str());
+            }
 
-      BackendInitContext backend_init_context(
-          method_allocator,
-          /*event_tracer=*/event_tracer_,
-          /*method_name=*/serialization_plan_->name()->c_str(),
-          /*named_data_map=*/named_data_map,
-          /*runtime_specs=*/delegate_runtime_specs);
-      Error err = BackendDelegate::Init(
-          delegate, program_, backend_init_context, &delegates_[i]);
-      if (err != Error::Ok) {
-        return err;
-      }
-      // ~Method() will try to clean up n_delegate_ entries in the delegates_
-      // array. Only increment this once we know the entry is valid, so that
-      // we don't try to clean up an uninitialized entry.
-      n_delegate_ = i + 1;
+            BackendInitContext backend_init_context(
+                method_allocator,
+                /*event_tracer=*/event_tracer_,
+                /*method_name=*/serialization_plan_->name()->c_str(),
+                /*named_data_map=*/named_data_map,
+                /*runtime_specs=*/delegate_runtime_specs);
+            Error init_err = BackendDelegate::Init(
+                delegate, program_, backend_init_context, &delegates_[i]);
+            if (init_err != Error::Ok) {
+              trace_delegate_init_event(
+                  "delegate_init_end",
+                  serialization_plan_->name()->c_str(),
+                  i,
+                  delegate,
+                  init_err);
+              return init_err;
+            }
+            trace_delegate_init_event(
+                "delegate_init_end",
+                serialization_plan_->name()->c_str(),
+                i,
+                delegate,
+                Error::Ok);
+            n_delegate_ = i + 1;
+          }
+          return Error::Ok;
+        });
+    if (err != Error::Ok) {
+      return err;
     }
   }
 
   {
     // Load chains
-    const auto chains = serialization_plan_->chains();
-    ET_CHECK_OR_RETURN_ERROR(
-        chains != nullptr && chains->size() > 0, InvalidProgram, "No chains");
-    n_chains_ = chains->size();
-    chains_ = method_allocator->allocateList<Chain>(n_chains_);
-    if (chains_ == nullptr) {
-      ET_LOG(Error, "Failed to allocate chains array of size %zu", n_chains_);
-      return Error::MemoryAllocationFailed;
-    }
-
-    // Try resolving all operators before failing, to make it easier to debug
-    // multiple problems at once.
-    Error delayed_error = Error::Ok;
-    int32_t num_instructions_missing_op = 0;
-    for (size_t i = 0; i < n_chains_; ++i) {
-      auto s_chain = chains->Get(i);
-      auto s_instructions = s_chain->instructions();
-      ET_CHECK_OR_RETURN_ERROR(
-          s_instructions != nullptr,
-          InvalidProgram,
-          "Missing instructions in chain %" ET_PRIsize_t,
-          i);
-      auto num_instructions = s_instructions->size();
-      auto chain_instruction_kernels =
-          method_allocator->allocateList<OpFunction>(num_instructions);
-      if (chain_instruction_kernels == nullptr) {
-        ET_LOG(
-            Error, "Failed to allocate instruction kernels for chain %zu", i);
-        return Error::MemoryAllocationFailed;
-      }
-      auto chain_instruction_arg_lists =
-          method_allocator->allocateList<InstructionArgs>(num_instructions);
-      if (chain_instruction_arg_lists == nullptr) {
-        ET_LOG(
-            Error, "Failed to allocate instruction arg lists for chain %zu", i);
-        return Error::MemoryAllocationFailed;
-      }
-
-      // Set up the argument lists ahead of time and store pointers to them to
-      // use when the instructions are called
-      for (size_t instr_idx = 0; instr_idx < s_instructions->size();
-           ++instr_idx) {
-        const auto instruction = s_instructions->Get(instr_idx);
-        // Ensure that the `instr_args_as_X()` calls will return non-null.
-        ET_CHECK_OR_RETURN_ERROR(
-            instruction != nullptr && instruction->instr_args() != nullptr,
-            InvalidProgram,
-            "Null instruction at index %" ET_PRIsize_t,
-            instr_idx);
-
-        const void* instr_args = instruction->instr_args();
-        switch (instruction->instr_args_type()) {
-          case executorch_flatbuffer::InstructionArguments::KernelCall: {
-            const auto* instr_args_as_KernelCall =
-                static_cast<const executorch_flatbuffer::KernelCall*>(
-                    instr_args);
-            const auto arg_idxs = instr_args_as_KernelCall->args();
-            ET_CHECK_OR_RETURN_ERROR(
-                arg_idxs != nullptr, InvalidProgram, "KernelCall args missing");
-            auto res = gen_instruction_arguments(
-                method_allocator,
-                n_value_,
-                values_,
-                arg_idxs->size(),
-                arg_idxs->data());
-            if (!res.ok()) {
-              return res.error();
-            }
-            chain_instruction_arg_lists[instr_idx] = res.get();
-            auto err = resolve_operator(
-                instr_args_as_KernelCall->op_index(),
-                chain_instruction_kernels,
-                instr_idx,
-                res.get(),
-                arg_idxs->size());
-            if (err == Error::OperatorMissing) {
-              num_instructions_missing_op++;
-            } else if (err == Error::MemoryAllocationFailed) {
-              return err;
-            } else {
-              delayed_error = err;
-            }
-          } break;
-          case executorch_flatbuffer::InstructionArguments::DelegateCall: {
-            const auto arg_idxs =
-                static_cast<const executorch_flatbuffer::DelegateCall*>(
-                    instr_args)
-                    ->args();
-            ET_CHECK_OR_RETURN_ERROR(
-                arg_idxs != nullptr,
-                InvalidProgram,
-                "DelegateCall args missing");
-            auto res = gen_instruction_arguments(
-                method_allocator,
-                n_value_,
-                values_,
-                arg_idxs->size(),
-                arg_idxs->data());
-            if (!res.ok()) {
-              return res.error();
-            }
-            chain_instruction_arg_lists[instr_idx] = res.get();
-          } break;
-          case executorch_flatbuffer::InstructionArguments::JumpFalseCall: {
-            auto index =
-                static_cast<const executorch_flatbuffer::JumpFalseCall*>(
-                    instr_args)
-                    ->cond_value_index();
-            ET_CHECK_VALID_VALUE_INDEX(index, n_value_);
-            chain_instruction_arg_lists[instr_idx] = InstructionArgs();
-          } break;
-          case executorch_flatbuffer::InstructionArguments::MoveCall: {
-            auto move_call =
-                static_cast<const executorch_flatbuffer::MoveCall*>(instr_args);
-            ET_CHECK_VALID_VALUE_INDEX(move_call->move_from(), n_value_);
-            ET_CHECK_VALID_VALUE_INDEX(move_call->move_to(), n_value_);
-            chain_instruction_arg_lists[instr_idx] = InstructionArgs();
-          } break;
-          case executorch_flatbuffer::InstructionArguments::FreeCall: {
-            auto index =
-                static_cast<const executorch_flatbuffer::FreeCall*>(instr_args)
-                    ->value_index();
-            ET_CHECK_VALID_VALUE_INDEX(index, n_value_);
-            chain_instruction_arg_lists[instr_idx] = InstructionArgs();
-          } break;
-          default: {
+    Error err = run_init_stage(
+        "Method::init.load_chains",
+        serialization_plan_->name()->c_str(),
+        [&]() -> Error {
+          const auto chains = serialization_plan_->chains();
+          ET_CHECK_OR_RETURN_ERROR(
+              chains != nullptr && chains->size() > 0,
+              InvalidProgram,
+              "No chains");
+          n_chains_ = chains->size();
+          chains_ = method_allocator->allocateList<Chain>(n_chains_);
+          if (chains_ == nullptr) {
             ET_LOG(
                 Error,
-                "Invalid instruction type %hhu",
-                static_cast<uint8_t>(instruction->instr_args_type()));
-            return Error::InvalidProgram;
+                "Failed to allocate chains array of size %zu",
+                n_chains_);
+            return Error::MemoryAllocationFailed;
           }
-        }
-      }
-      chains_[i] = Chain{
-          s_chain,
-          Span<InstructionArgs>(chain_instruction_arg_lists, num_instructions),
-          chain_instruction_kernels,
-      };
-    }
-    ET_CHECK_OR_RETURN_ERROR(
-        num_instructions_missing_op == 0,
-        OperatorMissing,
-        "There are %zu instructions don't have corresponding operator registered. "
-        "See logs for details",
-        static_cast<size_t>(num_instructions_missing_op));
-    if (delayed_error != Error::Ok) {
-      return delayed_error;
-    }
-  }
 
+          Error delayed_error = Error::Ok;
+          int32_t num_instructions_missing_op = 0;
+          for (size_t i = 0; i < n_chains_; ++i) {
+            auto s_chain = chains->Get(i);
+            auto s_instructions = s_chain->instructions();
+            ET_CHECK_OR_RETURN_ERROR(
+                s_instructions != nullptr,
+                InvalidProgram,
+                "Missing instructions in chain %" ET_PRIsize_t,
+                i);
+            auto num_instructions = s_instructions->size();
+            auto chain_instruction_kernels =
+                method_allocator->allocateList<OpFunction>(num_instructions);
+            if (chain_instruction_kernels == nullptr) {
+              ET_LOG(
+                  Error,
+                  "Failed to allocate instruction kernels for chain %zu",
+                  i);
+              return Error::MemoryAllocationFailed;
+            }
+            auto chain_instruction_arg_lists =
+                method_allocator->allocateList<InstructionArgs>(num_instructions);
+            if (chain_instruction_arg_lists == nullptr) {
+              ET_LOG(
+                  Error,
+                  "Failed to allocate instruction arg lists for chain %zu",
+                  i);
+              return Error::MemoryAllocationFailed;
+            }
+
+            for (size_t instr_idx = 0; instr_idx < s_instructions->size();
+                 ++instr_idx) {
+              const auto instruction = s_instructions->Get(instr_idx);
+              ET_CHECK_OR_RETURN_ERROR(
+                  instruction != nullptr && instruction->instr_args() != nullptr,
+                  InvalidProgram,
+                  "Null instruction at index %" ET_PRIsize_t,
+                  instr_idx);
+
+              const void* instr_args = instruction->instr_args();
+              switch (instruction->instr_args_type()) {
+                case executorch_flatbuffer::InstructionArguments::KernelCall: {
+                  const auto* instr_args_as_KernelCall =
+                      static_cast<const executorch_flatbuffer::KernelCall*>(
+                          instr_args);
+                  const auto arg_idxs = instr_args_as_KernelCall->args();
+                  ET_CHECK_OR_RETURN_ERROR(
+                      arg_idxs != nullptr,
+                      InvalidProgram,
+                      "KernelCall args missing");
+                  auto res = gen_instruction_arguments(
+                      method_allocator,
+                      n_value_,
+                      values_,
+                      arg_idxs->size(),
+                      arg_idxs->data());
+                  if (!res.ok()) {
+                    return res.error();
+                  }
+                  chain_instruction_arg_lists[instr_idx] = res.get();
+                  auto resolve_err = resolve_operator(
+                      instr_args_as_KernelCall->op_index(),
+                      chain_instruction_kernels,
+                      instr_idx,
+                      res.get(),
+                      arg_idxs->size());
+                  if (resolve_err == Error::OperatorMissing) {
+                    num_instructions_missing_op++;
+                  } else if (resolve_err == Error::MemoryAllocationFailed) {
+                    return resolve_err;
+                  } else {
+                    delayed_error = resolve_err;
+                  }
+                } break;
+                case executorch_flatbuffer::InstructionArguments::DelegateCall: {
+                  const auto* delegate_call_args =
+                      static_cast<const DelegateCallArgsInProgram*>(instr_args);
+                  const auto arg_idxs = delegate_call_args->args();
+                  ET_CHECK_OR_RETURN_ERROR(
+                      arg_idxs != nullptr,
+                      InvalidProgram,
+                      "DelegateCall args missing");
+                  trace_delegate_call_instruction(
+                      serialization_plan_->name()->c_str(),
+                      i,
+                      instr_idx,
+                      delegate_call_args->delegate_index(),
+                      arg_idxs);
+                  auto res = gen_instruction_arguments(
+                      method_allocator,
+                      n_value_,
+                      values_,
+                      arg_idxs->size(),
+                      arg_idxs->data());
+                  if (!res.ok()) {
+                    return res.error();
+                  }
+                  chain_instruction_arg_lists[instr_idx] = res.get();
+                } break;
+                case executorch_flatbuffer::InstructionArguments::JumpFalseCall: {
+                  auto index =
+                      static_cast<const executorch_flatbuffer::JumpFalseCall*>(
+                          instr_args)
+                          ->cond_value_index();
+                  ET_CHECK_VALID_VALUE_INDEX(index, n_value_);
+                  chain_instruction_arg_lists[instr_idx] = InstructionArgs();
+                } break;
+                case executorch_flatbuffer::InstructionArguments::MoveCall: {
+                  auto move_call =
+                      static_cast<const executorch_flatbuffer::MoveCall*>(
+                          instr_args);
+                  ET_CHECK_VALID_VALUE_INDEX(move_call->move_from(), n_value_);
+                  ET_CHECK_VALID_VALUE_INDEX(move_call->move_to(), n_value_);
+                  chain_instruction_arg_lists[instr_idx] = InstructionArgs();
+                } break;
+                case executorch_flatbuffer::InstructionArguments::FreeCall: {
+                  auto index =
+                      static_cast<const executorch_flatbuffer::FreeCall*>(
+                          instr_args)
+                          ->value_index();
+                  ET_CHECK_VALID_VALUE_INDEX(index, n_value_);
+                  chain_instruction_arg_lists[instr_idx] = InstructionArgs();
+                } break;
+                default: {
+                  ET_LOG(
+                      Error,
+                      "Invalid instruction type %hhu",
+                      static_cast<uint8_t>(instruction->instr_args_type()));
+                  return Error::InvalidProgram;
+                }
+              }
+            }
+            chains_[i] = Chain{
+                s_chain,
+                Span<InstructionArgs>(
+                    chain_instruction_arg_lists,
+                    num_instructions),
+                chain_instruction_kernels,
+            };
+          }
+          ET_CHECK_OR_RETURN_ERROR(
+              num_instructions_missing_op == 0,
+              OperatorMissing,
+              "There are %zu instructions don't have corresponding operator registered. "
+              "See logs for details",
+              static_cast<size_t>(num_instructions_missing_op));
+          if (delayed_error != Error::Ok) {
+            return delayed_error;
+          }
+          return Error::Ok;
+        });
+      if (err != Error::Ok) {
+        return err;
+      }
+    }
   step_state_ = StepState{0, 0};
 
   init_state_ = InitializationState::Initialized;
@@ -1460,6 +1903,12 @@ Error Method::execute_instruction() {
           /*event_tracer=*/event_tracer_,
           /*temp_allocator=*/temp_allocator_,
           /*method_name=*/serialization_plan_->name()->c_str());
+      trace_delegate_call_runtime_args(
+          serialization_plan_->name()->c_str(),
+          step_state_.chain_idx,
+          step_state_.instr_idx,
+          delegate_idx,
+          chain.argument_lists_[step_state_.instr_idx]);
       err = delegates_[delegate_idx].Execute(
           backend_execution_context,
           chain.argument_lists_[step_state_.instr_idx]);

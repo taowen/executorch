@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import logging
+import os
 import re
 import shlex
 from functools import partial
@@ -54,6 +55,7 @@ from .source_transformation.quantize import (
     get_quant_embedding_transform,
     get_quant_weight_transform,
 )
+from .rope_index_select_pass import RopeIndexTensorToIndexSelectPass
 from .source_transformation.rope import materialze_broadcast_of_rope_freq_cis
 from .source_transformation.sdpa import (
     replace_sdpa_with_custom_op,
@@ -760,6 +762,12 @@ def _to_edge_and_lower_llama(
     builder_exported_to_edge = builder_exported.pt2e_quantize(
         quantizers
     ).export_to_edge()
+    if builder_exported_to_edge.edge_manager is not None:
+        builder_exported_to_edge.edge_manager = (
+            builder_exported_to_edge.edge_manager.transform(
+                [RopeIndexTensorToIndexSelectPass()]
+            )
+        )
 
     partitioners = [
         get_vulkan_partitioner(
@@ -790,12 +798,19 @@ def _to_edge_and_lower_llama(
 
         # Generate ETRecord
         if edge_manager_copy:
+            etrecord_path = os.environ.get("ET_ETRECORD_PATH", "etrecord.bin")
+            exported_program_for_etrecord = None
+            if builder_exported.pre_autograd_graph_module is not None:
+                exported_program_for_etrecord = builder_exported._export(
+                    builder_exported.pre_autograd_graph_module
+                )
             generate_etrecord_func(
-                et_record="etrecord.bin",
+                et_record=etrecord_path,
                 edge_dialect_program=edge_manager_copy,
                 executorch_program=builder.export_program,
+                exported_program=exported_program_for_etrecord,
             )
-            logging.info("Generated etrecord.bin")
+            logging.info("Generated ETRecord: %s", etrecord_path)
     else:
         builder = builder_exported_to_edge.to_backend(partitioners)
         if verbose:

@@ -16,14 +16,20 @@ ExecuteNode::ExecuteNode(
     const std::vector<ArgGroup>& args,
     const std::string& name,
     const bool has_data_dependent_shape)
-    : resize_fn_(resize_fn),
+    : node_id_(
+#ifdef ET_EVENT_TRACER_ENABLED
+          get_current_operator_node_id()
+#else
+          UINT32_MAX
+#endif
+      ),
+      resize_fn_(resize_fn),
       resize_args_(resize_args),
       args_(args),
       name_(name),
       has_data_dependent_shape_(has_data_dependent_shape) {
 #ifdef ET_EVENT_TRACER_ENABLED
-  operator_json = set_and_get_current_operator_json("");
-  operator_count = get_current_operator_count();
+  operator_json = get_current_operator_json();
 #endif
 }
 

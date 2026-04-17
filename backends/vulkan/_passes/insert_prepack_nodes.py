@@ -9,7 +9,7 @@
 from copy import deepcopy
 
 from executorch.backends.vulkan.op_registry import handles_own_prepacking
-from executorch.backends.vulkan.utils import is_param_node
+from executorch.backends.vulkan.utils import is_mutable_buffer_node, is_param_node
 
 from executorch.exir.dialects._ops import ops as exir_ops
 
@@ -31,6 +31,12 @@ def insert_prepack_nodes(program: ExportedProgram) -> ExportedProgram:  # noqa: 
         # Prepacking is only needed for constant tensors. Only nodes corresponding to
         # constant tensors will proceed beyond this point.
         if not is_param_node(program, node):
+            continue
+
+        # Mutable buffers are runtime state, not serialized constants. They must
+        # remain regular tensor inputs to the delegate rather than being converted
+        # to TensorRef/prepack constants.
+        if is_mutable_buffer_node(node, program):
             continue
 
         # Mark that this node is going to be represented as a TensorRef type in the

@@ -136,6 +136,19 @@ void clone(ComputeGraph& graph, const std::vector<ValueRef>& args) {
   const utils::StorageType src_storage = graph.storage_type_of(src);
   const utils::StorageType dst_storage = graph.storage_type_of(dst);
 
+  VK_CHECK_COND(
+      src_storage == utils::kBuffer || graph.dim_of(src) <= 4,
+      "texture clone input requires <=4 dims; got dim=",
+      graph.dim_of(src),
+      " for ValueRef ",
+      src);
+  VK_CHECK_COND(
+      dst_storage == utils::kBuffer || graph.dim_of(dst) <= 4,
+      "texture clone output requires <=4 dims; got dim=",
+      graph.dim_of(dst),
+      " for ValueRef ",
+      dst);
+
   // Handle int8x4 (quantized) tensors with block-based clone
   if (graph.dtype_of(src) == vkapi::kInt8x4 &&
       graph.dtype_of(dst) == vkapi::kInt8x4) {

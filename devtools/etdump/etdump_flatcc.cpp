@@ -32,6 +32,7 @@ using ::executorch::runtime::DelegateDebugIntId;
 using ::executorch::runtime::Error;
 using ::executorch::runtime::EValue;
 using ::executorch::runtime::EventTracerEntry;
+using ::executorch::runtime::kUnsetDebugHandle;
 using ::executorch::runtime::kUnsetDelegateDebugIntId;
 using ::executorch::runtime::LoggedEValueType;
 using ::executorch::runtime::Result;
@@ -356,6 +357,38 @@ Result<bool> ETDumpGen::log_intermediate_output_delegate(
       name, delegate_debug_index, output);
 }
 
+Result<bool> ETDumpGen::should_materialize_delegate_intermediate_output(
+    const char* name,
+    DelegateDebugIntId delegate_debug_index) {
+  ET_CHECK_OR_RETURN_ERROR(
+      (name == nullptr) ^ (delegate_debug_index == kUnsetDelegateDebugIntId),
+      InvalidArgument,
+      "Only name or delegate_debug_index can be valid. Check DelegateMappingBuilder documentation for more details.");
+
+  if (event_tracer_debug_level() <
+      executorch::runtime::EventTracerDebugLogLevel::kIntermediateOutputs) {
+    return false;
+  }
+
+  if (delegate_intermediate_output_filter_ == nullptr) {
+    return false;
+  }
+
+  Result<bool> result = delegate_intermediate_output_filter_->filter_delegate(
+      name, delegate_debug_index, debug_handle_);
+  if (!result.ok()) {
+    return result;
+  }
+
+  return !result.get();
+}
+
+bool ETDumpGen::has_delegate_intermediate_output_focus() const {
+  return event_tracer_debug_level() >=
+          executorch::runtime::EventTracerDebugLogLevel::kIntermediateOutputs &&
+      delegate_intermediate_output_filter_ != nullptr;
+}
+
 template <typename T>
 Result<bool> ETDumpGen::log_intermediate_output_delegate_helper(
     const char* name,
@@ -366,8 +399,9 @@ Result<bool> ETDumpGen::log_intermediate_output_delegate_helper(
       InvalidArgument,
       "Only name or delegate_debug_index can be valid. Check DelegateMappingBuilder documentation for more details.");
 
-  if (filter_) {
-    Result<bool> result = filter_->filter(name, delegate_debug_index);
+  if (delegate_intermediate_output_filter_) {
+    Result<bool> result = delegate_intermediate_output_filter_->filter_delegate(
+        name, delegate_debug_index, debug_handle_);
     if (!result.ok()) {
       return result;
     }
@@ -381,23 +415,21 @@ Result<bool> ETDumpGen::log_intermediate_output_delegate_helper(
 
   check_ready_to_add_events();
   int64_t string_id = name != nullptr ? create_string_entry(name) : -1;
-
-  etdump_DebugEvent_start(builder_);
-
-  etdump_DebugEvent_chain_index_add(builder_, chain_id_);
-  etdump_DebugEvent_instruction_id_add(builder_, debug_handle_);
-  if (string_id == -1) {
-    etdump_DebugEvent_delegate_debug_id_int_add(builder_, delegate_debug_index);
-  } else {
-    etdump_DebugEvent_delegate_debug_id_str_add(builder_, string_id);
-  }
+  etdump_Value_ref_t value_ref = 0;
 
   // Check the type of `output` then call the corresponding logging functions
   if constexpr (std::is_same<T, Tensor>::value) {
     Result<long> offset = write_tensor_or_return_error(output);
-    ET_CHECK_MSG(
-        offset.ok(),
-        "write_tensor_or_return_error() failed to write tensor to debug buffer");
+    if (!offset.ok()) {
+      ET_LOG(
+          Error,
+          "Skipping delegate tensor debug entry: failed to write tensor to debug buffer "
+          "(error=0x%" PRIx32 ", nbytes=%zu, dim=%zd)",
+          static_cast<uint32_t>(offset.error()),
+          output.nbytes(),
+          output.dim());
+      return false;
+    }
     Result<etdump_Tensor_ref_t> tensor_ref =
         add_tensor_entry(builder_, output, offset.get());
     if (!tensor_ref.ok()) {
@@ -407,14 +439,23 @@ Result<bool> ETDumpGen::log_intermediate_output_delegate_helper(
     etdump_Value_start(builder_);
     etdump_Value_val_add(builder_, etdump_ValueType_Tensor);
     etdump_Value_tensor_add(builder_, tensor_ref.get());
+    value_ref = etdump_Value_end(builder_);
 
   } else if constexpr (std::is_same<T, ArrayRef<Tensor>>::value) {
     etdump_Tensor_vec_start(builder_);
     for (size_t i = 0; i < output.size(); ++i) {
       Result<long> offset = write_tensor_or_return_error(output[i]);
-      ET_CHECK_MSG(
-          offset.ok(),
-          "write_tensor_or_return_error() failed to write tensor to debug buffer");
+      if (!offset.ok()) {
+        ET_LOG(
+            Error,
+            "Skipping delegate tensor list debug entry[%zu]: failed to write tensor "
+            "to debug buffer (error=0x%" PRIx32 ", nbytes=%zu, dim=%zd)",
+            i,
+            static_cast<uint32_t>(offset.error()),
+            output[i].nbytes(),
+            output[i].dim());
+        return false;
+      }
       Result<etdump_Tensor_ref_t> tensor_ref =
           add_tensor_entry(builder_, output[i], offset.get());
       if (!tensor_ref.ok()) {
@@ -429,18 +470,21 @@ Result<bool> ETDumpGen::log_intermediate_output_delegate_helper(
     etdump_Value_start(builder_);
     etdump_Value_val_add(builder_, etdump_ValueType_TensorList);
     etdump_Value_tensor_list_add(builder_, tensor_list_ref);
+    value_ref = etdump_Value_end(builder_);
   } else if constexpr (std::is_same<T, int>::value) {
     auto int_ref = etdump_Int_create(builder_, output);
 
     etdump_Value_start(builder_);
     etdump_Value_val_add(builder_, etdump_ValueType_Int);
     etdump_Value_int_value_add(builder_, int_ref);
+    value_ref = etdump_Value_end(builder_);
   } else if constexpr (std::is_same<T, double>::value) {
     auto double_ref = etdump_Double_create(builder_, output);
 
     etdump_Value_start(builder_);
     etdump_Value_double_value_add(builder_, double_ref);
     etdump_Value_val_add(builder_, etdump_ValueType_Double);
+    value_ref = etdump_Value_end(builder_);
   } else if constexpr (std::is_same<T, bool>::value) {
     flatbuffers_bool_t flatbuffer_bool_val =
         output ? FLATBUFFERS_TRUE : FLATBUFFERS_FALSE;
@@ -449,6 +493,7 @@ Result<bool> ETDumpGen::log_intermediate_output_delegate_helper(
     etdump_Value_start(builder_);
     etdump_Value_bool_value_add(builder_, bool_ref);
     etdump_Value_val_add(builder_, etdump_ValueType_Bool);
+    value_ref = etdump_Value_end(builder_);
   } else {
     ET_CHECK_OR_RETURN_ERROR(
         0,
@@ -456,7 +501,14 @@ Result<bool> ETDumpGen::log_intermediate_output_delegate_helper(
         "Unsupported output type for intermediate logging\n");
   }
 
-  auto value_ref = etdump_Value_end(builder_);
+  etdump_DebugEvent_start(builder_);
+  etdump_DebugEvent_chain_index_add(builder_, chain_id_);
+  etdump_DebugEvent_instruction_id_add(builder_, debug_handle_);
+  if (string_id == -1) {
+    etdump_DebugEvent_delegate_debug_id_int_add(builder_, delegate_debug_index);
+  } else {
+    etdump_DebugEvent_delegate_debug_id_str_add(builder_, string_id);
+  }
   etdump_DebugEvent_debug_entry_add(builder_, value_ref);
 
   etdump_DebugEvent_ref_t debug_event = etdump_DebugEvent_end(builder_);
@@ -564,18 +616,38 @@ Result<bool> ETDumpGen::log_evalue(
     LoggedEValueType evalue_type) {
   check_ready_to_add_events();
 
-  etdump_DebugEvent_start(builder_);
+  if (
+      evalue_type == LoggedEValueType::kIntermediateOutput &&
+      intermediate_output_filter_ != nullptr) {
+    if (debug_handle_ == kUnsetDebugHandle) {
+      return false;
+    }
+    Result<bool> result =
+        intermediate_output_filter_->filter(nullptr, debug_handle_);
+    if (!result.ok()) {
+      return result;
+    }
+    if (result.get()) {
+      return false;
+    }
+  }
 
-  etdump_DebugEvent_chain_index_add(builder_, chain_id_);
-  etdump_DebugEvent_instruction_id_add(builder_, debug_handle_);
+  etdump_Value_ref_t value_ref = 0;
 
   switch (evalue.tag) {
     case Tag::Tensor: {
       executorch::aten::Tensor tensor = evalue.toTensor();
       Result<long> offset = write_tensor_or_return_error(tensor);
-      ET_CHECK_MSG(
-          offset.ok(),
-          "write_tensor_or_return_error() failed to write tensor to debug buffer");
+      if (!offset.ok()) {
+        ET_LOG(
+            Error,
+            "Skipping tensor debug entry: failed to write tensor to debug buffer "
+            "(error=0x%" PRIx32 ", nbytes=%zu, dim=%zd)",
+            static_cast<uint32_t>(offset.error()),
+            tensor.nbytes(),
+            tensor.dim());
+        return false;
+      }
       Result<etdump_Tensor_ref_t> tensor_ref =
           add_tensor_entry(builder_, tensor, offset.get());
       if (!tensor_ref.ok()) {
@@ -589,9 +661,7 @@ Result<bool> ETDumpGen::log_evalue(
         auto bool_ref = etdump_Bool_create(builder_, FLATBUFFERS_TRUE);
         etdump_Value_output_add(builder_, bool_ref);
       }
-      auto value_ref = etdump_Value_end(builder_);
-
-      etdump_DebugEvent_debug_entry_add(builder_, value_ref);
+      value_ref = etdump_Value_end(builder_);
       break;
     }
 
@@ -601,9 +671,17 @@ Result<bool> ETDumpGen::log_evalue(
       etdump_Tensor_vec_start(builder_);
       for (size_t i = 0; i < tensors.size(); ++i) {
         Result<long> offset = write_tensor_or_return_error(tensors[i]);
-        ET_CHECK_MSG(
-            offset.ok(),
-            "write_tensor_or_return_error() failed to write tensor to debug buffer");
+        if (!offset.ok()) {
+          ET_LOG(
+              Error,
+              "Skipping tensor list debug entry[%zu]: failed to write tensor to debug "
+              "buffer (error=0x%" PRIx32 ", nbytes=%zu, dim=%zd)",
+              i,
+              static_cast<uint32_t>(offset.error()),
+              tensors[i].nbytes(),
+              tensors[i].dim());
+          return false;
+        }
         Result<etdump_Tensor_ref_t> tensor_ref =
             add_tensor_entry(builder_, tensors[i], offset.get());
         if (!tensor_ref.ok()) {
@@ -622,9 +700,7 @@ Result<bool> ETDumpGen::log_evalue(
         auto bool_ref = etdump_Bool_create(builder_, FLATBUFFERS_TRUE);
         etdump_Value_output_add(builder_, bool_ref);
       }
-      auto value_ref = etdump_Value_end(builder_);
-
-      etdump_DebugEvent_debug_entry_add(builder_, value_ref);
+      value_ref = etdump_Value_end(builder_);
       break;
     }
 
@@ -635,8 +711,7 @@ Result<bool> ETDumpGen::log_evalue(
       etdump_Value_start(builder_);
       etdump_Value_val_add(builder_, etdump_ValueType_Int);
       etdump_Value_int_value_add(builder_, int_ref);
-      auto value_ref = etdump_Value_end(builder_);
-      etdump_DebugEvent_debug_entry_add(builder_, value_ref);
+      value_ref = etdump_Value_end(builder_);
 
       break;
     }
@@ -648,8 +723,7 @@ Result<bool> ETDumpGen::log_evalue(
       etdump_Value_start(builder_);
       etdump_Value_double_value_add(builder_, double_ref);
       etdump_Value_val_add(builder_, etdump_ValueType_Double);
-      auto value_ref = etdump_Value_end(builder_);
-      etdump_DebugEvent_debug_entry_add(builder_, value_ref);
+      value_ref = etdump_Value_end(builder_);
 
       break;
     }
@@ -662,19 +736,26 @@ Result<bool> ETDumpGen::log_evalue(
       etdump_Value_start(builder_);
       etdump_Value_bool_value_add(builder_, bool_ref);
       etdump_Value_val_add(builder_, etdump_ValueType_Bool);
-      auto value_ref = etdump_Value_end(builder_);
-      etdump_DebugEvent_debug_entry_add(builder_, value_ref);
+      value_ref = etdump_Value_end(builder_);
 
       break;
     }
 
     default:
-      ET_CHECK_MSG(
-          0,
-          "This EValue type = %d is not yet supported for logging\n",
-          static_cast<int>(evalue.tag));
-      break;
+      ET_LOG(
+          Error,
+          "Skipping unsupported EValue type=%d while logging %s",
+          static_cast<int>(evalue.tag),
+          evalue_type == LoggedEValueType::kIntermediateOutput
+              ? "intermediate output"
+              : "program output");
+      return false;
   }
+
+  etdump_DebugEvent_start(builder_);
+  etdump_DebugEvent_chain_index_add(builder_, chain_id_);
+  etdump_DebugEvent_instruction_id_add(builder_, debug_handle_);
+  etdump_DebugEvent_debug_entry_add(builder_, value_ref);
 
   etdump_DebugEvent_ref_t debug_event = etdump_DebugEvent_end(builder_);
 
@@ -696,9 +777,14 @@ DataSinkBase* ETDumpGen::get_data_sink() {
   return data_sink_;
 }
 
+void ETDumpGen::set_intermediate_output_filter(
+    EventTracerFilterBase* filter) {
+  intermediate_output_filter_ = filter;
+}
+
 void ETDumpGen::set_delegation_intermediate_output_filter(
     EventTracerFilterBase* filter) {
-  filter_ = filter;
+  delegate_intermediate_output_filter_ = filter;
 }
 
 Result<long> ETDumpGen::write_tensor_or_return_error(Tensor tensor) {

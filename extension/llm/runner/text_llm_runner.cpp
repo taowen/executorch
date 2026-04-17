@@ -19,12 +19,22 @@
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <pytorch/tokenizers/sentencepiece.h>
 #include <pytorch/tokenizers/tiktoken.h>
+#include <cstdio>
+#include <cstdlib>
+#include <inttypes.h>
 
 namespace executorch::extension::llm {
 
 using ::executorch::extension::Module;
 using ::executorch::runtime::Error;
 using ::executorch::runtime::Result;
+
+namespace {
+inline bool should_dump_token_ids() {
+  const char* v = std::getenv("ET_DEBUG_TOKEN_IDS");
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+} // namespace
 
 TextLLMRunner::TextLLMRunner(
     std::unordered_map<std::string, int64_t> metadata,
@@ -131,6 +141,17 @@ Error TextLLMRunner::generate(
     // encode the (string) prompt into tokens sequence
     prompt_tokens = encode_res.get();
     num_prompt_tokens = prompt_tokens.size();
+    if (should_dump_token_ids()) {
+      fprintf(stderr, "[et_token] prompt_ids=");
+      for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+        fprintf(
+            stderr,
+            "%s%" PRIu64,
+            (i == 0 ? "" : ","),
+            static_cast<uint64_t>(prompt_tokens[i]));
+      }
+      fprintf(stderr, "\n");
+    }
 
     ET_CHECK_OR_RETURN_ERROR(
         num_prompt_tokens >= 1,
@@ -156,6 +177,9 @@ Error TextLLMRunner::generate(
     auto prefill_res = text_prefiller_->prefill(prompt_tokens, pos_);
     ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
     cur_token = prefill_res.get();
+    if (should_dump_token_ids()) {
+      fprintf(stderr, "[et_token] prefill_next=%" PRIu64 "\n", cur_token);
+    }
     prefill_next_token_.reset();
   } else {
     // Empty prompt: consume token from a prior prefill() call
@@ -164,6 +188,9 @@ Error TextLLMRunner::generate(
         InvalidState,
         "Empty prompt requires a prior prefill() call");
     cur_token = prefill_next_token_.value();
+    if (should_dump_token_ids()) {
+      fprintf(stderr, "[et_token] prefill_cached_next=%" PRIu64 "\n", cur_token);
+    }
     prefill_next_token_.reset();
   }
 

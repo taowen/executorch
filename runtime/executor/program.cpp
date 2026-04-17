@@ -371,6 +371,30 @@ Result<Method> Program::load_method(
   if (!plan.ok()) {
     return plan.error();
   }
+#if defined(__cpp_exceptions)
+  try {
+    return Method::load(
+        plan.get(),
+        this,
+        memory_manager,
+        event_tracer,
+        named_data_map,
+        backend_options);
+  } catch (const std::exception& ex) {
+    ET_LOG(
+        Error,
+        "Program::load_method(%s) threw C++ exception: %s",
+        method_name,
+        ex.what());
+    return Error::Internal;
+  } catch (...) {
+    ET_LOG(
+        Error,
+        "Program::load_method(%s) threw unknown C++ exception",
+        method_name);
+    return Error::Internal;
+  }
+#else
   return Method::load(
       plan.get(),
       this,
@@ -378,6 +402,7 @@ Result<Method> Program::load_method(
       event_tracer,
       named_data_map,
       backend_options);
+#endif
 }
 
 Result<MethodMeta> Program::method_meta(const char* method_name) const {

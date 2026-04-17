@@ -846,20 +846,25 @@ def _map_non_sequence_aot_output(
     # Use the last element of the runtime output as fallback if no match is found
     aot_mapped_runtime_intermediate_output = runtime_intermediate_output[negative_index]
 
-    # delegate runtime call and AOT intermediate is not a sequence.
-    # For multi-output operations (like native_layer_norm.out, native_dropout.out),
-    # the runtime captures all outputs but AOT only captures the primary output.
-    # We need to find the runtime output that matches the AOT output shape and dtype.
+    # Delegate runtime call and AOT intermediate is not a sequence.
+    # For multi-output operations, keep index-based mapping when it already
+    # matches shape+dtype; otherwise, fall back to shape/dtype matching.
     if (
-        num_outputs == 1
-        and len(runtime_intermediate_output) > 1
+        len(runtime_intermediate_output) > 1
         and isinstance(aot_intermediate_output, torch.Tensor)
     ):
-        aot_mapped_runtime_intermediate_output = (
-            _find_matching_runtime_output_by_shape_and_dtype(
-                aot_intermediate_output, runtime_intermediate_output
+        if not (
+            isinstance(aot_mapped_runtime_intermediate_output, torch.Tensor)
+            and aot_mapped_runtime_intermediate_output.shape
+            == aot_intermediate_output.shape
+            and aot_mapped_runtime_intermediate_output.dtype
+            == aot_intermediate_output.dtype
+        ):
+            aot_mapped_runtime_intermediate_output = (
+                _find_matching_runtime_output_by_shape_and_dtype(
+                    aot_intermediate_output, runtime_intermediate_output
+                )
             )
-        )
 
     return aot_mapped_runtime_intermediate_output
 
@@ -891,6 +896,14 @@ def _process_single_runtime_output(
 
     if aot_combined_debug_handle == (-1,):
         # Skip this mapping if the aot combined debug handle and runtime debug handle do not exact match.
+        return None
+
+    if (
+        isinstance(runtime_intermediate_output, Sequence)
+        and len(runtime_intermediate_output) < output_index + 1
+    ):
+        # Some runtime traces only materialize a subset of outputs for a debug handle.
+        # Skip unmapped trailing outputs instead of indexing past the available tensors.
         return None
 
     if isinstance(aot_intermediate_output, Sequence):
@@ -964,13 +977,34 @@ def map_runtime_aot_intermediate_outputs(
             )
 
         runtime_debug_handle, runtime_intermediate_output, num_outputs = runtime_list[0]
-        # iterate through each of the output from runtime,
+        # Some runtime debug entries can report num_outputs > 0 while carrying
+        # an empty sequence payload. Skip these malformed entries so numeric
+        # gap computation can proceed on valid mappings.
+        if (
+            isinstance(runtime_intermediate_output, Sequence)
+            and len(runtime_intermediate_output) == 0
+        ):
+            continue
+
+        # runtime metadata can over-report num_outputs for some delegate debug
+        # entries. Clamp to available runtime payload/debug handles to avoid
+        # indexing beyond captured tensors.
+        effective_num_outputs = int(num_outputs)
+        if isinstance(runtime_intermediate_output, Sequence):
+            effective_num_outputs = min(
+                effective_num_outputs, len(runtime_intermediate_output)
+            )
+        effective_num_outputs = min(effective_num_outputs, len(runtime_debug_handle))
+        if effective_num_outputs <= 0:
+            continue
+
+        # iterate through each output from runtime,
         # get the corresponding debug handle
         # and map it to the aot debug handle
         # and create a dictionary that maps aot debug handle + aot output to
         # runtime debug handle + runtime output
         # Note this works only for delegate case for now.
-        for i in range(num_outputs):
+        for i in range(effective_num_outputs):
             result = _process_single_runtime_output(
                 aot_list,
                 runtime_debug_handle,

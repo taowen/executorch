@@ -25,10 +25,15 @@
 #include <executorch/backends/vulkan/runtime/graph/ops/DynamicDispatchNode.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/ExecuteNode.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/PrepackNode.h>
+#ifdef ET_EVENT_TRACER_ENABLED
+#include <executorch/runtime/core/event_tracer.h>
+#endif
 
 #ifdef ET_EVENT_TRACER_ENABLED
-std::string& set_and_get_current_operator_json(const std::string& json);
-size_t get_current_operator_count(const bool increment = false);
+void set_current_operator_json(const std::string& json);
+const std::string& get_current_operator_json();
+void set_current_operator_node_id(uint32_t node_id);
+uint32_t get_current_operator_node_id();
 #endif
 
 namespace vkcompute {
@@ -187,6 +192,10 @@ class ComputeGraph final {
 
   std::vector<std::unique_ptr<PrepackNode>> prepack_nodes_;
   std::vector<std::unique_ptr<ExecuteNode>> execute_nodes_;
+
+#ifdef ET_EVENT_TRACER_ENABLED
+  std::unordered_map<ValueRef, ValueRef> delegate_debug_staging_cache_;
+#endif
 
   std::vector<IOValueRef> inputs_;
   std::vector<IOValueRef> outputs_;
@@ -1118,6 +1127,11 @@ class ComputeGraph final {
   //
 
   void execute();
+
+#ifdef ET_EVENT_TRACER_ENABLED
+  void execute_with_delegate_debug_capture(
+      executorch::runtime::EventTracer* event_tracer);
+#endif
 
   //
   // Tensor View

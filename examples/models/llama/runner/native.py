@@ -44,6 +44,14 @@ class NativeLlamaRunner(LlamaRunner):
             vocab_size=params["vocab_size"],
         )
         self.model = _load_for_executorch(args.pte)
+        if args.kv_cache:
+            try:
+                forward_meta = self.model.method_meta("forward")
+                token_input_sizes = forward_meta.input_tensor_meta(0).sizes()
+                if tuple(token_input_sizes) == (1, 1):
+                    self.prefill_chunk_size = 1
+            except Exception:
+                pass
 
     def forward(
         self,
@@ -123,7 +131,7 @@ def build_args_parser() -> argparse.ArgumentParser:
         "--max_len",
         type=int,
         default=128,
-        help="Maximum length of the generated response sequence.",
+        help="Maximum total sequence length, including both prompt tokens and generated tokens.",
     )
 
     return parser

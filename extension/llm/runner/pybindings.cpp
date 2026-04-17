@@ -34,13 +34,19 @@ using namespace executorch::extension;
 using namespace executorch::runtime;
 
 // Helper macro for error handling
-#define THROW_IF_ERROR(error, message, ...)                       \
-  ({                                                              \
-    if ((error) != Error::Ok) {                                   \
-      char msg_buf[256];                                          \
-      snprintf(msg_buf, sizeof(msg_buf), message, ##__VA_ARGS__); \
-      throw std::runtime_error(msg_buf);                          \
-    }                                                             \
+#define THROW_IF_ERROR(error, message, ...)                                     \
+  ({                                                                            \
+    if ((error) != Error::Ok) {                                                 \
+      char msg_buf[512];                                                        \
+      snprintf(                                                                 \
+          msg_buf,                                                              \
+          sizeof(msg_buf),                                                      \
+          message " (error=%u, %s)",                                            \
+          ##__VA_ARGS__,                                                        \
+          static_cast<unsigned>((error)),                                       \
+          executorch::runtime::to_string((error)));                             \
+      throw std::runtime_error(msg_buf);                                        \
+    }                                                                           \
   })
 
 // Python wrapper class for TextLLMRunner

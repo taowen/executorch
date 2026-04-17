@@ -2663,6 +2663,7 @@ TEST(VulkanToFromGPUShaderTest, round_trip_tests) {
       {67, 23},
       {55, 33},
       // 3D sizes
+      {1, 1, 1024},
       {7, 9, 13},
       {21, 2, 19},
       {17, 17, 5},

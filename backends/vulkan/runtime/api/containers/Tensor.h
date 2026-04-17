@@ -499,6 +499,9 @@ class vTensor final {
    * instead of the original sizes.
    */
   inline const utils::ivec3& logical_limits() const {
+    VK_CHECK_COND(
+        uniform_data_ != nullptr,
+        "logical_limits() is unavailable for tensors with ndim > 4");
     return uniform_data_->logical_limits.limits;
   }
 
